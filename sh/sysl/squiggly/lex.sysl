@@ -1,0 +1,267 @@
+module sh.sysl.squiggly
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Ascii, Search, parse_real}
+
+// Reading a template into pieces: runs of text, and tags already cut into tokens.
+//
+// **A tag ends at the closing delimiter that is not inside anything.** Scala squiggly found the
+// first `}}` in the text and handed what came before it to the tag parser, so `{{ "}}" }}` and
+// `{{ {a: {b: 1}} }}` both broke. Here the tag is tokenized from the template itself: a string
+// literal is read whole, a brace or bracket opened inside the tag is counted, and only a delimiter
+// met at depth zero closes the tag. That is also what lets every token's span be an offset into
+// the template, so an error inside a tag names the template's line and column.
+//
+// **Whitespace before a token is recorded on the token**, because two things in the grammar turn on
+// it. `a.b` is a field of `a` and `a .b` is `a` applied to `.b`; `xs[0]` is an index and `f [0]` is
+// `f` applied to a list. The tokens are the same and only the space between them differs.
+
+/** A token inside a tag. */
+enum Tok
+    /** An identifier or a keyword; the grammar decides which. */
+    Word(s: string)
+    /** A number literal, already a value. */
+    Number(v: Value)
+    /** `-` written hard against a digit and with a space before it: `take -1`. */
+    NegNumber(v: Value)
+    /** A string literal, its escapes decoded. */
+    Text(s: string)
+    /** Punctuation: an operator, a bracket, a dot, a backtick. */
+    Sym(s: string)
+    /** The end of the tag. */
+    Close
+
+/** A token, where it was, and whether whitespace came before it. */
+struct Token
+    tok: Tok
+    at: Span
+    spaced: bool
+
+/** A piece of a template before its tags are given structure. */
+enum Piece
+    /** Text, copied as it is -- after the trim markers on either side of it have had their way. */
+    Chunk(at: Span, s: string)
+    /** A tag: its tokens (the last is always `Close`), the span from delimiter to delimiter, and
+     * whether it carried `-` trim markers.
+     */
+    Tag(at: Span, toks: Buf[Token], trim_left: bool, trim_right: bool)
+    /** A `{{// … }}` comment, which renders as nothing but still trims. */
+    Comment(at: Span, trim_left: bool, trim_right: bool)
+
+/** The template's text and tags, in order, with trimming applied to the text. */
+private[squiggly] pieces(src: Source, open: string, close: string) -> Result[Buf[Piece], Diagnostic]
+    var s = scan(src)
+    val out: Buf[Piece] = buf()
+
+    loop
+        val start = s.offset
+        val found = src.bytes.index_of_from(open.bytes, start)
+        val text_end = found match
+            Some(i) -> i
+            None -> src.bytes.len
+
+        if text_end > start then out.push(Chunk(Span(start, text_end), slice_text(src, start, text_end)))
+
+        found match
+            None -> break
+            Some(i) ->
+                s.reset(i + open.len)
+                out.push(tag(src, &s, i, open, close)?)
+
+    trim(out)
+    Ok(out)
+end pieces
+
+// One tag, with the cursor just past its opening delimiter.
+private tag(src: Source, s: *Scanner, from: usize, open: string, close: string) -> Result[Piece, Diagnostic]
+    // `{{-` trims only when whitespace follows the dash, so that `{{-3}}` is the number.
+    val trim_left = s.peek() == Some(u8('-')) && s.peek_at(1).map(c -> c.is_space()) == Some(true)
+
+    if trim_left then s.bump()
+
+    s.skip_space()
+
+    if s.starts_with("//".bytes) then
+        val end_at = src.bytes.index_of_from(close.bytes, s.offset) match
+            Some(i) -> i
+            None -> return Err(unclosed(src, from, open, close))
+
+        val trim_right = end_at >= 2 && src.bytes[end_at - 1] == u8('-') && src.bytes[end_at - 2].is_space()
+
+        s.reset(end_at + close.len)
+        return Ok(Comment(Span(from, s.offset), trim_left, trim_right))
+
+    val toks: Buf[Token] = buf()
+    var depth = 0
+    var trim_right = false
+
+    loop
+        val spaced = skip_gap(s, close)?
+
+        if s.at_end() then return Err(unclosed(src, from, open, close))
+
+        val at = s.offset
+
+        if depth == 0 && s.starts_with(close.bytes) then
+            s.skip(close.len)
+            toks.push(Token(Close, Span(at, s.offset), spaced))
+            break
+
+        if depth == 0 && spaced && s.peek() == Some(u8('-')) && rest_starts(s, 1, close) then
+            s.skip(1 + close.len)
+            trim_right = true
+            toks.push(Token(Close, Span(at, s.offset), spaced))
+            break
+
+        val t = token(src, s, spaced)?
+
+        // Only a bracket whose closer begins the delimiter is counted: a `{` for `}}`. An unclosed
+        // `(` then cannot hide the end of the tag, and is reported as the `)` it is missing.
+        t.tok match
+            Sym(x) -> if x.len == 1 then
+                val c = x.bytes[0]
+
+                if closer_of(c) == close.bytes[0] then depth += 1
+                elif c == close.bytes[0] && depth > 0 then depth -= 1
+            _ -> ()
+
+        toks.push(t)
+
+    Ok(Tag(Span(from, s.offset), toks, trim_left, trim_right))
+end tag
+
+private closer_of(c: u8) -> u8 =
+    if c == u8('(') then u8(')')
+    elif c == u8('[') then u8(']')
+    elif c == u8('{') then u8('}')
+    else 0
+
+// Whitespace and comments before the next token, and whether there were any. A `//` comment runs
+// to the end of the line or to the closing delimiter, whichever comes first, so `{{ x // note }}`
+// still closes.
+private skip_gap(s: *Scanner, close: string) -> Result[bool, Diagnostic]
+    var spaced = false
+
+    loop
+        if s.skip_space() > 0 then
+            spaced = true
+        elif s.starts_with("/*".bytes) then
+            val at = s.offset
+
+            s.skip(2)
+
+            loop
+                if s.at_end() then return Err(error(Span(at, at + 2), "this comment is never closed"))
+
+                if s.starts_with("*/".bytes) then
+                    s.skip(2)
+                    break
+
+                s.bump()
+
+            spaced = true
+        elif s.starts_with("//".bytes) then
+            while !s.at_end() && !s.at_line_end() && !s.starts_with(close.bytes) do s.bump()
+
+            spaced = true
+        else
+            break
+
+    Ok(spaced)
+end skip_gap
+
+private rest_starts(s: *Scanner, skip: usize, want: string) -> bool
+    val r = s.rest()
+
+    r.len >= skip && r[skip..<r.len].starts_with(want.bytes)
+
+private val symbols: []const string = [
+    "<-", ":=", "<=", ">=", "!=", "++",
+    "+", "-", "*", "/", "\\", "^", "(", ")", "[", "]", "{", "}", "`", "|", ".", ",", "<", ">", "=",
+    "$", ":"]
+
+// One token, with the cursor on its first byte.
+private token(src: Source, s: *Scanner, spaced: bool) -> Result[Token, Diagnostic]
+    val at = s.offset
+    val c = s.peek().unwrap()
+
+    if c.is_alpha() || c == u8('_') || c >= 128 then
+        s.accept_while(c -> c.is_alnum() || c == u8('_') || c >= 128)
+        return Ok(Token(Word(slice_text(src, at, s.offset)), s.span_from(at), spaced))
+
+    if c.is_digit() || (c == u8('.') && s.peek_at(1).map(d -> d.is_digit()) == Some(true)) then
+        return Ok(Token(Number(number(src, s)?), s.span_from(at), spaced))
+
+    if c == u8('-') && spaced && s.peek_at(1).map(d -> d.is_digit()) == Some(true) then
+        s.bump()
+
+        val v = number(src, s)?
+
+        return Ok(Token(NegNumber(negate(v)), s.span_from(at), spaced))
+
+    if c == u8('\'') || c == u8('"') then
+        return read_quoted(s, c) match
+            Ok(text) -> Ok(Token(Text(text), s.span_from(at), spaced))
+            Err(e) -> Err(lit_error(src, e, "string"))
+
+    for sym in symbols
+        if s.accept_seq(sym.bytes) then return Ok(Token(Sym(sym), s.span_from(at), spaced))
+
+    s.next_char()
+    Err(error(s.span_from(at), s"`${slice_text(src, at, s.offset)}` cannot appear in a tag")
+        .with_label("not part of any expression"))
+end token
+
+// A number, with the cursor on its first digit (or on the dot of `.5`).
+private number(src: Source, s: *Scanner) -> Result[Value, Diagnostic]
+    val at = s.offset
+
+    if s.peek() == Some(u8('.')) then
+        s.bump()
+        s.accept_while(c -> c.is_digit())
+
+        return parse_real(src.bytes[at..<s.offset]) match
+            Ok(x) -> Ok(Real(x))
+            Err(_) -> Err(error(s.span_from(at), "this number is malformed"))
+
+    read_number(s) match
+        Ok(Int(n)) -> Ok(if n <= 9223372036854775807u64 then Int(long(n)) else Real(real(n)))
+        Ok(Real(x)) -> Ok(Real(x))
+        Err(e) -> Err(lit_error(src, e, "number"))
+
+private negate(v: Value) -> Value = v match
+    Int(n) -> Int(-n)
+    Real(x) -> Real(-x)
+    _ -> v
+
+private lit_error(src: Source, e: LitError, what: string) -> Diagnostic =
+    error(where(e), s"this $what is malformed: $e")
+
+private unclosed(src: Source, from: usize, open: string, close: string) -> Diagnostic =
+    error(Span(from, from + open.len), s"this tag is never closed")
+        .with_label(s"no `$close` after this `$open`")
+
+// Trim markers: `{{-` eats the whitespace that ends the text before it, `-}}` the whitespace that
+// begins the text after it. A chunk that is all whitespace and sits between a `-}}` and a `{{-`
+// vanishes from both ends, which is what it should do.
+private trim(ps: Buf[Piece])
+    for i in 0..<ps.len()
+        val (left, right) = ps[i] match
+            Tag(_, _, l, r) -> (l, r)
+            Comment(_, l, r) -> (l, r)
+            Chunk(_, _) -> (false, false)
+
+        if left && i > 0 then
+            ps[i - 1] match
+                Chunk(at, text) -> ps[i - 1] = Chunk(at, text.trim_end())
+                _ -> ()
+
+        if right && i + 1 < ps.len() then
+            ps[i + 1] match
+                Chunk(at, text) -> ps[i + 1] = Chunk(at, text.trim_start())
+                _ -> ()
+end trim
+
+private[squiggly] slice_text(src: Source, from: usize, to: usize) -> string =
+    sysl.text.from_utf8_unchecked(src.bytes[from..<to])

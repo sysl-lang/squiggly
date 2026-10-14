@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Not found — {{ .site.title }}</title>
+  {{ if .site.favicon }}<link rel="icon" href="{{ relURL .site.favicon }}">{{ end }}
+
+  <!-- 404 bypasses baseof, so the pre-paint theme script + site
+       palette overrides are inlined here. -->
+  <script>
+    (function() {
+      try {
+        var stored = localStorage.getItem('juicer-theme');
+        var dark = stored
+          ? stored === 'dark'
+          : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="{{ relURL '/juicergallery.css' }}">
+
+  {{ if .site.juicergallery }}
+  <style>
+    :root {
+      {{ if .site.juicergallery.brand }}--brand: {{ .site.juicergallery.brand }};{{ end }}
+      {{ if .site.juicergallery.accent }}--accent: {{ .site.juicergallery.accent }};{{ end }}
+    }
+    [data-theme="dark"] {
+      {{ if .site.juicergallery.brandDark }}--brand: {{ .site.juicergallery.brandDark }};{{ end }}
+      {{ if .site.juicergallery.accentDark }}--accent: {{ .site.juicergallery.accentDark }};{{ end }}
+    }
+  </style>
+  {{ end }}
+</head>
+<body>
+  <div class="juicergallery-page">
+    {{ partial 'topbar' . }}
+    <main class="juicergallery-main">
+      <article class="juicergallery-page-wrap juicergallery-404">
+        <h1>Page not found</h1>
+        <p>Whatever you were looking for, it isn't here. <a href="{{ relURL '/' }}">Return home</a>.</p>
+      </article>
+    </main>
+    {{ partial 'footer' . }}
+  </div>
+</body>
+</html>

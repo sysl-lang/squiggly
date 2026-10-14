@@ -1,0 +1,675 @@
+module sh.sysl.squiggly
+
+import sh.sysl.parsing.{Diagnostic, Source, Span, error, nearest_name}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.math.{Float, checked_add, checked_mul, checked_sub}
+import sysl.text.{StrBuilder, str_builder}
+
+// Rendering: a template's nodes run against a value, into text.
+//
+// **Variables are one table per render**, as they were in Scala squiggly, and that is a feature a
+// theme leans on: `{{ shown := 0 }}` before a loop and `{{ shown := shown + 1 }}` inside it count,
+// because the loop's body writes the same `shown` the line before it did. A `for` binds its names
+// into the same table. A partial gets a table of its own, so nothing it assigns leaks back out.
+//
+// **An error is a value, never a crash.** Every evaluation answers a `Result`, and the error names
+// the template, the line and the column of the expression that failed -- inside a partial, the
+// partial's -- with the line quoted under it.
+
+/** What went wrong reading or rendering a template, and the template it went wrong in. */
+struct TemplateError
+    diag: Diagnostic
+    src: Source
+
+    /** The headline: what is wrong, without the place. */
+    message(self) -> string = self.diag.message
+
+    /** The template's name, line and column, as `page.html:3:14`. */
+    place(self) -> string
+        val loc = self.src.locate(self.diag.span.start)
+
+        s"${self.src.name}:${loc.line}:${loc.col}"
+
+    /** The whole diagnostic: the headline, the place, and the line with a caret under the spot. */
+    render(self) -> string = self.diag.render(self.src)
+end TemplateError
+
+impl Display for TemplateError
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(s"${self.place()}: ${self.message()}", out, fmt)
+
+/** Why a function could not answer.
+ *
+ * `Message` is the ordinary case -- the wrong kind of argument, an index out of range -- and the
+ * engine places it at the call. `Raised` is an error that already has a place: one that happened
+ * inside a lambda the function evaluated, or inside a partial it rendered, and is passed on as it
+ * is so that the caret lands where the mistake is.
+ */
+enum Fail
+    Message(text: string)
+    Raised(e: TemplateError)
+
+/** A function that refuses, with this reason. */
+fail(text: string) -> Result[Value, Fail] = Err(Message(text))
+
+/** How many arguments a function with no upper limit may take. */
+const many: usize = 1000000
+
+/** A function a template can call: its name, how many arguments it takes, and the body.
+ *
+ * **A function of exactly one argument is also a field.** `x.upper` is `upper x` wherever `x` has
+ * no field of that name, which is what makes `.tags.length` and `'hi'.reverse.upper` read.
+ */
+struct Func
+    name: string
+    min: usize
+    max: usize
+    call: &Fn(*Ctx, Buf[Value]) -> Result[Value, Fail]
+
+/** Where a partial comes from: its name in, and the template out, `None` when there is no such
+ * partial, or the error parsing it gave.
+ */
+type Loader = &Fn(string) -> Option[Result[Template, TemplateError]]
+
+/** What a render produced: the text, and the value a `{{ return … }}` handed back -- `null` when
+ * there was none.
+ */
+struct Rendered
+    text: string
+    value: Value
+
+/** The functions a template can call and the partials it can include. Build one with `engine()`,
+ * add to it with `define` and `partials`, and render as many templates against it as there are.
+ */
+struct Engine
+    funcs: Map[string, Func]
+    loader: Option[Loader]
+    max_depth: usize
+
+    /** Add a function, or replace a builtin of the same name. `min` and `max` bound how many
+     * arguments it takes; `many` is no bound.
+     */
+    define(self, name: string, min: usize, max: usize, f: &Fn(*Ctx, Buf[Value]) -> Result[Value, Fail]) =
+        self.funcs.put(name, Func(name, min, max, f))
+
+    /** Whether a function of this name is defined. */
+    has(self, name: string) -> bool = self.funcs.has(name)
+
+    /** Take partials from this loader. */
+    partials(*self, l: Loader) = self.loader = Some(l)
+
+    /** A template rendered against `data`, into text. */
+    render(self, t: Template, data: Value) -> Result[string, TemplateError] =
+        self.run(t, data, t).map(r -> r.text)
+
+    /** A layout rendered with a page's blocks: every `{{ block name }}` in `layout` renders the
+     * page's `{{ define name }}` where the page has one, and its own body where it does not.
+     * The layout's own `define`s count too, and the page's win over them.
+     */
+    render_layout(self, layout: Template, page: Template, data: Value) -> Result[string, TemplateError] =
+        self.run(layout, data, page).map(r -> r.text)
+
+    /** `render`, answering the `return` value beside the text. */
+    run(self, t: Template, data: Value, page: Template) -> Result[Rendered, TemplateError]
+        val blocks: Map[string, BlockDef] = map()
+
+        add_blocks(blocks, t)
+
+        add_blocks(blocks, page)
+
+        var c = Ctx(self, t, data, data, map(), str_builder(), blocks, None, 0)
+
+        exec(&c, t.body)?
+
+        Ok(Rendered(c.out.finish(), c.ret.unwrap_or(Null)))
+end Engine
+
+private add_blocks(blocks: Map[string, BlockDef], t: Template)
+    for (k, body) in t.defines do blocks.put(k, BlockDef(body, t))
+
+/** A block body and the template it was written in, which its errors name. */
+private[squiggly] struct BlockDef
+    body: Buf[Node]
+    tpl: Template
+
+/** An engine with every builtin defined and no partials. */
+engine() -> Engine
+    var e = Engine(map(), None, 64)
+
+    add_builtins(e)
+    e
+
+/** One render in progress: what a builtin is handed, so that it can evaluate a lambda or render a
+ * partial the way the template it was called from would.
+ */
+struct Ctx
+    private[squiggly] engine: Engine
+    private[squiggly] tpl: Template
+    private[squiggly] data: Value
+    private[squiggly] root: Value
+    private[squiggly] vars: Map[string, Value]
+    private[squiggly] out: StrBuilder
+    private[squiggly] blocks: Map[string, BlockDef]
+    private[squiggly] ret: Option[Value]
+    private[squiggly] depth: usize
+
+    /** The current value, `.`. */
+    dot(self) -> Value = self.data
+
+    /** The value the render started from, `$`. */
+    root_value(self) -> Value = self.root
+
+    /** A lambda evaluated with `.` bound to `x`; anything but a lambda is refused. */
+    apply(*self, f: Value, x: Value) -> Result[Value, Fail]
+        f match
+            Lambda(body) ->
+                val saved = self.data
+
+                self.data = x
+
+                val r = eval(self, *body)
+
+                self.data = saved
+
+                r match
+                    Ok(v) -> Ok(v)
+                    Err(e) -> Err(Raised(e))
+            _ -> fail(s"expected a lambda, written between backticks, but got ${f.kind()}")
+
+    /** A partial rendered with `data` as both `.` and `$`.
+     *
+     * **It answers the partial's text**, so `{{ partial 'card' . }}` prints it and
+     * `{{ c := partial 'card' . }}` keeps it -- unless the partial executed `{{ return x }}`, in
+     * which case the answer is `x` and the partial is a function.
+     */
+    partial(*self, name: string, data: Value) -> Result[Value, Fail]
+        val loader = self.engine.loader match
+            Some(l) -> l
+            None -> return fail(s"there is no partial named `$name`: no partials were given to the engine")
+
+        val t = loader(name) match
+            None -> return fail(s"there is no partial named `$name`")
+            Some(Err(e)) -> return Err(Raised(e))
+            Some(Ok(t)) -> t
+
+        if self.depth >= self.engine.max_depth then
+            return fail(s"partials are nested more than ${self.engine.max_depth} deep -- does `$name` include itself?")
+
+        var c = Ctx(self.engine, t, data, data, map(), str_builder(), self.blocks, None, self.depth + 1)
+
+        exec(&c, t.body) match
+            Err(e) -> return Err(Raised(e))
+            Ok(_) -> ()
+
+        c.ret match
+            Some(v) -> Ok(v)
+            None -> Ok(Str(c.out.finish()))
+end Ctx
+
+private oops(c: *Ctx, at: Span, msg: string) -> TemplateError = TemplateError(error(at, msg), c.tpl.src)
+
+// -- nodes -----------------------------------------------------------------------------------------
+
+// Run a body. `true` when a `return` stopped it, which stops everything around it too.
+private exec(c: *Ctx, nodes: Buf[Node]) -> Result[bool, TemplateError]
+    for n in nodes
+        if step(c, n)? then return Ok(true)
+
+    Ok(false)
+
+private step(c: *Ctx, n: Node) -> Result[bool, TemplateError]
+    n match
+        Text(s) -> c.out.push(s)
+        Out(e) -> write_value(&c.out, eval(c, e)?)
+        Assign(_, name, e) -> c.vars.put(name, eval(c, e)?)
+        Return(_, e) ->
+            c.ret = Some(e match
+                Some(x) -> eval(c, x)?
+                None -> Null)
+            return Ok(true)
+        If(arms, els) ->
+            for arm in arms
+                if eval(c, arm.tests[0])?.truthy() then return exec(c, arm.body)
+
+            return else_branch(c, els)
+        Match(_, e, arms, els) ->
+            val v = eval(c, e)?
+
+            for arm in arms
+                for t in arm.tests
+                    if eval(c, t)? == v then return exec(c, arm.body)
+
+            return else_branch(c, els)
+        With(_, e, body, els) ->
+            val v = eval(c, e)?
+
+            if !v.truthy() then return else_branch(c, els)
+
+            return within(c, v, body)
+        For(at, first, second, e, body, els) -> return for_loop(c, at, first, second, eval(c, e)?, body, els)
+        Define(_) -> ()
+        Block(_, name, e, body) ->
+            val v = eval(c, e)?
+
+            c.blocks.get(name) match
+                Some(def) ->
+                    val saved = c.tpl
+
+                    c.tpl = def.tpl
+
+                    val r = within(c, v, def.body)
+
+                    c.tpl = saved
+                    return r
+                None -> return within(c, v, body)
+
+    Ok(false)
+end step
+
+private else_branch(c: *Ctx, els: Option[Buf[Node]]) -> Result[bool, TemplateError] = els match
+    Some(b) -> exec(c, b)
+    None -> Ok(false)
+
+// A body run with `.` bound to `v`.
+private within(c: *Ctx, v: Value, body: Buf[Node]) -> Result[bool, TemplateError]
+    val saved = c.data
+
+    c.data = v
+
+    val r = exec(c, body)
+
+    c.data = saved
+    r
+
+// `for`: a list gives its elements (and their indexes, to a second name); a map gives its values,
+// or its keys and values to two names. Nothing at all -- `null`, an empty list, an empty map --
+// runs the `else`.
+private for_loop(c: *Ctx, at: Span, first: string, second: string, v: Value, body: Buf[Node], els: Option[Buf[Node]]) -> Result[bool, TemplateError]
+    if !v.truthy() then return else_branch(c, els)
+
+    val saved = c.data
+    var stopped = false
+
+    v match
+        List(xs) ->
+            for i in 0..<xs.len()
+                if first.len > 0 then c.vars.put(first, xs[i])
+                if second.len > 0 then c.vars.put(second, Int(long(i)))
+
+                c.data = xs[i]
+
+                if exec(c, body)? then
+                    stopped = true
+                    break
+        Obj(es) ->
+            for i in 0..<es.len()
+                if second.len > 0 then
+                    c.vars.put(first, Str(es[i].key))
+                    c.vars.put(second, es[i].value)
+                elif first.len > 0 then
+                    c.vars.put(first, es[i].value)
+
+                c.data = es[i].value
+
+                if exec(c, body)? then
+                    stopped = true
+                    break
+        _ -> return Err(oops(c, at, s"`for` needs a list or a map, and this is ${v.kind()}"))
+
+    c.data = saved
+    Ok(stopped)
+end for_loop
+
+// -- expressions -----------------------------------------------------------------------------------
+
+private[squiggly] eval(c: *Ctx, e: Expr) -> Result[Value, TemplateError]
+    e match
+        Lit(_, v) -> Ok(v)
+        Path(at, root, names) ->
+            var v = if root then c.root else c.data
+
+            for n in names do v = field(c, at, v, n)?
+
+            Ok(v)
+        Var(at, name) -> variable(c, at, name)
+        GVar(at, name) -> c.vars.get(name) match
+            Some(v) -> Ok(v)
+            None -> Err(unknown_variable(c, at, name))
+        ListLit(_, items) ->
+            val xs: Buf[Value] = buf()
+
+            for x in items do xs.push(eval(c, x)?)
+
+            Ok(List(xs))
+        MapLit(_, keys, vals) ->
+            val m = new_obj()
+
+            for i in 0..<keys.len() do m.put(keys[i], eval(c, vals[i])?)
+
+            Ok(m)
+        Neg(at, x) -> eval(c, *x)? match
+            Int(n) -> if n == -9223372036854775807 - 1 then Ok(Real(-real(n))) else Ok(Int(-n))
+            Real(r) -> Ok(Real(-r))
+            v -> Err(oops(c, at, s"`-` needs a number, and this is ${v.kind()}"))
+        Not(_, x) -> Ok(Bool(!eval(c, *x)?.truthy()))
+        Bin(at, op, l, r) -> op match
+            // `or` and `and` answer an operand, as they do in Python and Lua: `.title or 'Untitled'`.
+            Or ->
+                val lv = eval(c, *l)?
+
+                if lv.truthy() then Ok(lv) else eval(c, *r)
+            And ->
+                val lv = eval(c, *l)?
+
+                if !lv.truthy() then Ok(lv) else eval(c, *r)
+            _ ->
+                val lv = eval(c, *l)?
+                val rv = eval(c, *r)?
+
+                arith(op, lv, rv) match
+                    Ok(v) -> Ok(v)
+                    Err(m) -> Err(oops(c, at, m))
+        Compare(_, first, ops, rest) ->
+            var lv = eval(c, *first)?
+
+            for i in 0..<ops.len()
+                val rv = eval(c, rest[i])?
+
+                compare(ops[i], lv, rv) match
+                    Ok(b) -> if !b then return Ok(Bool(false))
+                    Err(m) -> return Err(oops(c, rest[i].span(), m))
+
+                lv = rv
+
+            Ok(Bool(true))
+        Cond(_, test, yes, no) ->
+            if eval(c, *test)?.truthy() then return eval(c, *yes)
+
+            no match
+                Some(n) -> eval(c, *n)
+                None -> Ok(Null)
+        Field(at, x, name) -> field(c, at, eval(c, *x)?, name)
+        Index(_, x, i) -> index(c, eval(c, *x)?, eval(c, *i)?, i.span())
+        Call(at, name, args) ->
+            val vs: Buf[Value] = buf()
+
+            for a in args do vs.push(eval(c, a)?)
+
+            call(c, at, name, vs)
+        Quote(_, x) -> Ok(Lambda(x))
+end eval
+
+// A bare name: a variable if one is set, otherwise a function that takes no arguments.
+private variable(c: *Ctx, at: Span, name: string) -> Result[Value, TemplateError]
+    c.vars.get(name) match
+        Some(v) -> return Ok(v)
+        None -> ()
+
+    c.engine.funcs.get(name) match
+        Some(f) ->
+            if f.min == 0 then return call(c, at, name, buf())
+
+            Err(oops(c, at, s"`$name` is a function of ${arity_text(f)}, and was given none"))
+        None -> Err(unknown_variable(c, at, name))
+
+private unknown_variable(c: *Ctx, at: Span, name: string) -> TemplateError
+    val names: Buf[string] = buf()
+
+    for (k, _) in c.vars do names.push(k)
+
+    val msg = s"there is no variable `$name`"
+
+    nearest_name(name, names) match
+        Some(n) -> TemplateError(error(at, msg).with_note(s"did you mean `$n`?"), c.tpl.src)
+        None -> oops(c, at, msg)
+
+private arity_text(f: Func) -> string =
+    if f.max == f.min then sh.sysl.parsing.counted(f.min, "argument")
+    elif f.max == many then s"at least ${sh.sysl.parsing.counted(f.min, "argument")}"
+    else s"${f.min} to ${f.max} arguments"
+
+// A call by name. A name that is not a function but is a variable gets told so, since `x -1` (a
+// call) for `x - 1` (a subtraction) is the usual way to get here.
+private[squiggly] call(c: *Ctx, at: Span, name: string, args: Buf[Value]) -> Result[Value, TemplateError]
+    val f = c.engine.funcs.get(name) match
+        Some(f) -> f
+        None ->
+            if c.vars.has(name) then
+                return Err(TemplateError(error(at, s"`$name` is a variable, not a function, so it cannot take arguments")
+                    .with_note("a subtraction is written with a space after the `-` too: `n - 1`"), c.tpl.src))
+
+            val names: Buf[string] = buf()
+
+            for (k, _) in c.engine.funcs do names.push(k)
+
+            val msg = s"there is no function `$name`"
+
+            return Err(nearest_name(name, names) match
+                Some(n) -> TemplateError(error(at, msg).with_note(s"did you mean `$n`?"), c.tpl.src)
+                None -> oops(c, at, msg))
+
+    if args.len() < f.min || args.len() > f.max then
+        return Err(oops(c, at, s"`$name` takes ${arity_text(f)}, and was given ${args.len()}"))
+
+    f.call(c, args) match
+        Ok(v) -> Ok(v)
+        Err(Message(m)) -> Err(oops(c, at, s"`$name`: $m"))
+        Err(Raised(e)) -> Err(e)
+
+// `v.name`: a map's entry, else a one-argument function applied to `v`. A missing entry, and any
+// field of `null`, is `null` -- so `.page.author.name` is safe to write where there is no author.
+private field(c: *Ctx, at: Span, v: Value, name: string) -> Result[Value, TemplateError]
+    v match
+        Obj(_) -> v.get(name) match
+            Some(x) -> return Ok(x)
+            None -> ()
+        Null -> return Ok(Null)
+        _ -> ()
+
+    c.engine.funcs.get(name) match
+        Some(f) -> if f.min <= 1 && f.max >= 1 then
+            val args: Buf[Value] = buf()
+
+            args.push(v)
+            return call(c, at, name, args)
+        None -> ()
+
+    v match
+        Obj(_) -> Ok(Null)
+        _ -> Err(oops(c, at, s"${v.kind()} has no field `$name`"))
+end field
+
+// `x[i]`: a list's element, a map's entry, or a string's character. A negative index counts from
+// the end, so `xs[-1]` is the last.
+private index(c: *Ctx, v: Value, i: Value, at: Span) -> Result[Value, TemplateError]
+    v match
+        List(xs) ->
+            val n = position(c, i, xs.len(), at)?
+
+            Ok(xs[n])
+        Str(s) ->
+            val chars: Buf[char] = buf()
+
+            for ch in s.chars do chars.push(ch)
+
+            val n = position(c, i, chars.len(), at)?
+
+            Ok(Str(str(chars[n])))
+        Obj(_) -> i match
+            Str(k) -> Ok(v.get(k).unwrap_or(Null))
+            _ -> Err(oops(c, at, s"a map is indexed by a string, and this is ${i.kind()}"))
+        Null -> Ok(Null)
+        _ -> Err(oops(c, at, s"${v.kind()} cannot be indexed"))
+
+private position(c: *Ctx, i: Value, len: usize, at: Span) -> Result[usize, TemplateError]
+    val n = i match
+        Int(n) -> n
+        _ -> return Err(oops(c, at, s"an index is a whole number, and this is ${i.kind()}"))
+
+    val k = if n < 0 then long(len) + n else n
+
+    if k < 0 || k >= long(len) then return Err(oops(c, at, s"index $n is out of range for length $len"))
+
+    Ok(usize(k))
+
+// -- arithmetic ------------------------------------------------------------------------------------
+
+/** A binary operator applied to two values, or why it cannot be. */
+private[squiggly] arith(op: Op, l: Value, r: Value) -> Result[Value, string]
+    if op == Concat then return concat(l, r)
+
+    val name = op_text(op)
+
+    l match
+        Int(a) -> r match
+            Int(b) -> int_op(op, a, b)
+            Real(y) -> real_op(op, real(a), y)
+            _ -> Err(operand(name, r))
+        Real(x) -> r match
+            Int(b) -> real_op(op, x, real(b))
+            Real(y) -> real_op(op, x, y)
+            _ -> Err(operand(name, r))
+        _ -> Err(operand(name, l))
+
+private operand(name: string, v: Value) -> string = s"`$name` needs numbers, and one side is ${v.kind()}"
+
+// Integer arithmetic stays integral while it fits and the operation allows: `/` is exact when it
+// divides, and an overflow continues as a real rather than wrapping.
+private int_op(op: Op, a: long, b: long) -> Result[Value, string]
+    op match
+        Add -> Ok(checked_add(a, b).map(n -> Int(n)).unwrap_or(Real(real(a) + real(b))))
+        Sub -> Ok(checked_sub(a, b).map(n -> Int(n)).unwrap_or(Real(real(a) - real(b))))
+        Mul -> Ok(checked_mul(a, b).map(n -> Int(n)).unwrap_or(Real(real(a) * real(b))))
+        Div ->
+            if b == 0 then return Err("division by zero")
+
+            if b != -1 && a % b == 0 then Ok(Int(a / b)) else Ok(Real(real(a) / real(b)))
+        Quot ->
+            if b == 0 then return Err("division by zero")
+
+            if b == -1 then Ok(checked_sub(0, a).map(n -> Int(n)).unwrap_or(Real(-real(a)))) else Ok(Int(a / b))
+        Mod ->
+            if b == 0 then return Err("division by zero")
+
+            if b == -1 then Ok(Int(0)) else Ok(Int(a % b))
+        Pow ->
+            if b < 0 then return Ok(Real(real(a).pow(real(b))))
+
+            var acc: long = 1
+
+            for _ in 0..<b
+                checked_mul(acc, a) match
+                    Some(n) -> acc = n
+                    None -> return Ok(Real(real(a).pow(real(b))))
+
+            Ok(Int(acc))
+        _ -> Err("not an arithmetic operator")
+end int_op
+
+private real_op(op: Op, x: real, y: real) -> Result[Value, string]
+    op match
+        Add -> Ok(Real(x + y))
+        Sub -> Ok(Real(x - y))
+        Mul -> Ok(Real(x * y))
+        Div -> if y == 0.0 then Err("division by zero") else Ok(Real(x / y))
+        Quot -> if y == 0.0 then Err("division by zero") else Ok(whole((x / y).trunc()))
+        Mod -> if y == 0.0 then Err("division by zero") else Ok(Real(x.fmod(y)))
+        Pow -> Ok(Real(x.pow(y)))
+        _ -> Err("not an arithmetic operator")
+
+/** A real with no fraction as an `Int` where it fits, so `floor 3.7` is `3` and not `3.0`. */
+private[squiggly] whole(x: real) -> Value =
+    if x >= -9.2e18 && x <= 9.2e18 && x == x.trunc() then Int(long(x)) else Real(x)
+
+// `++`: two lists joined, or the text of either side joined to a string.
+private concat(l: Value, r: Value) -> Result[Value, string]
+    l match
+        List(xs) -> r match
+            List(ys) ->
+                val out = xs.copy()
+
+                for y in ys do out.push(y)
+
+                return Ok(List(out))
+            _ -> ()
+        _ -> ()
+
+    if is_str(l) || is_str(r) then return Ok(Str(text_of(l) + text_of(r)))
+
+    Err(s"`++` joins two lists, or a string to anything, and these are ${l.kind()} and ${r.kind()}")
+
+private is_str(v: Value) -> bool = v match
+    Str(_) -> true
+    _ -> false
+
+/** A comparison of two values, or why they cannot be compared. */
+private[squiggly] compare(op: Cmp, l: Value, r: Value) -> Result[bool, string]
+    op match
+        Eq -> return Ok(l == r)
+        Ne -> return Ok(l != r)
+        Divides ->
+            return arith(Mod, r, l) match
+                Ok(m) -> Ok(m == Int(0))
+                Err(e) -> Err(e)
+        _ -> ()
+
+    val order = ordering(l, r)?
+
+    Ok(op match
+        Lt -> order < 0
+        Le -> order <= 0
+        Gt -> order > 0
+        Ge -> order >= 0
+        _ -> false)
+end compare
+
+/** -1, 0 or 1 as `l` sorts before, with or after `r`: numbers by value, strings by their bytes. */
+private[squiggly] ordering(l: Value, r: Value) -> Result[int, string]
+    l match
+        Str(a) -> r match
+            Str(b) -> return Ok(if a < b then -1 elif a == b then 0 else 1)
+            _ -> ()
+        _ -> ()
+
+    val x = as_real(l)
+    val y = as_real(r)
+
+    if x.is_none() || y.is_none() then return Err(s"${l.kind()} and ${r.kind()} cannot be put in order")
+
+    // An integer is compared as an integer, which a conversion to real would round past 2^53.
+    l match
+        Int(a) -> r match
+            Int(b) -> return Ok(if a < b then -1 elif a == b then 0 else 1)
+            Real(y) -> return Ok(int_vs_real(a, y))
+            _ -> ()
+        Real(x) -> r match
+            Int(b) -> return Ok(-int_vs_real(b, x))
+            _ -> ()
+        _ -> ()
+
+    val (p, q) = (x.unwrap(), y.unwrap())
+
+    Ok(if p < q then -1 elif p == q then 0 else 1)
+end ordering
+
+/** -1, 0 or 1 as the integer `n` is below, at or above the real `x`, exactly. A NaN is above every
+ * integer, which keeps a sort total.
+ */
+private[squiggly] int_vs_real(n: long, x: real) -> int
+    if x != x then return -1
+    if x >= 9223372036854775808.0 then return -1
+    if x < -9223372036854775808.0 then return 1
+
+    val t = x.trunc()
+    val k = long(t)
+
+    if n < k then -1
+    elif n > k then 1
+    elif x > t then -1
+    elif x < t then 1
+    else 0
+
+private[squiggly] as_real(v: Value) -> Option[real] = v match
+    Int(n) -> Some(real(n))
+    Real(x) -> Some(x)
+    _ -> None

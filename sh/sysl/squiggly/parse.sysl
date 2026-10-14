@@ -1,0 +1,796 @@
+module sh.sysl.squiggly
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.Search
+
+// Parsing: a template's pieces given block structure, and each tag's tokens given an expression.
+//
+// **The expression grammar, loosest first:**
+//
+//     if c then a else b
+//     or      and      not
+//     = != < <= > >= div        chained: 1 < x <= 9
+//     x | f a b                 the pipe puts x last: f(a, b, x)
+//     + - ++    * / \ mod    unary -    ^ (right-associative)
+//     f a b                     application: a bare name followed by arguments
+//     x.name  x[i]              written hard against x, with no space
+//
+// **Application binds tighter than any operator**, so `f x + 1` is `(f x) + 1` and `x - 1` is a
+// subtraction. Scala squiggly read an application's arguments as whole sums, which made `x - 1`
+// the call `x(-1)` and made a bare variable's subscript, `xs[0]`, a call too. Here an argument is
+// a single operand -- a literal, a path, a name, a bracketed or parenthesized thing -- and the only
+// place a space changes meaning is the one a reader can see: `-1` written with a space before it and
+// none after is a negative argument, so `take -1 .xs` passes `-1` while `n - 1` subtracts.
+
+private val reserved: []const string = [
+    "if", "then", "else", "elsif", "div", "and", "or", "not", "mod", "define", "block", "return",
+    "end", "match", "case", "with", "for", "true", "false", "null"]
+
+private is_reserved(w: string) -> bool
+    for r in reserved
+        if r == w then return true
+
+    false
+
+/** A template read from its text, or the first thing wrong with it.
+ *
+ *     parse("page.html", text) match
+ *         Ok(t) -> ...
+ *         Err(e) -> print(e.render())
+ */
+parse(name: string, text: string) -> Result[Template, TemplateError] = parse_with(name, text, "{{", "}}")
+
+/** `parse`, with delimiters other than `{{` and `}}` -- a shortcode syntax, say, or text in which
+ * `{{` already means something.
+ */
+parse_with(name: string, text: string, open: string, close: string) -> Result[Template, TemplateError]
+    val src = source_of(name, text)
+
+    read_template(src, open, close) match
+        Ok(t) -> Ok(t)
+        Err(d) -> Err(TemplateError(d, src))
+
+private read_template(src: Source, open: string, close: string) -> Result[Template, Diagnostic]
+    var b = Builder(src, pieces(src, open, close)?, 0, map())
+    val (nodes, stop) = body(&b)?
+
+    stop match
+        SEof -> ()
+        _ -> return Err(stray(stop))
+
+    Ok(Template(src, nodes, b.defines))
+
+// -- block structure -------------------------------------------------------------------------------
+
+private struct Builder
+    src: Source
+    ps: Buf[Piece]
+    i: usize
+    defines: Map[string, Buf[Node]]
+
+// Why a body stopped: the end of the template, or one of the tags that close or divide a block.
+private enum Stop
+    SEof
+    SEnd(at: Span)
+    SElse(at: Span)
+    SElsif(at: Span, e: Expr)
+    SCase(at: Span, es: Buf[Expr])
+
+// A body: everything up to the next tag that ends or divides a block, which is answered beside it.
+private body(b: *Builder) -> Result[(Buf[Node], Stop), Diagnostic]
+    val nodes: Buf[Node] = buf()
+
+    while b.i < b.ps.len()
+        val piece = b.ps[b.i]
+
+        b.i += 1
+
+        piece match
+            Chunk(_, text) -> if text.len > 0 then nodes.push(Text(text))
+            Comment(_, _, _) -> ()
+            Tag(at, toks, _, _) ->
+                tag_kind(b.src, toks)? match
+                    KOut(e) -> nodes.push(Out(e))
+                    KAssign(name, e) -> nodes.push(Assign(at, name, e))
+                    KReturn(e) -> nodes.push(Return(at, e))
+                    KEnd -> return Ok((nodes, SEnd(at)))
+                    KElse -> return Ok((nodes, SElse(at)))
+                    KElsif(e) -> return Ok((nodes, SElsif(at, e)))
+                    KCase(es) -> return Ok((nodes, SCase(at, es)))
+                    KIf(e) -> nodes.push(if_block(b, at, e)?)
+                    KFor(first, second, e) ->
+                        val (inner, els) = with_else(b, at, "for")?
+
+                        nodes.push(For(at, first, second, e, inner, els))
+                    KWith(e) ->
+                        val (inner, els) = with_else(b, at, "with")?
+
+                        nodes.push(With(at, e, inner, els))
+                    KMatch(e) -> nodes.push(match_block(b, at, e)?)
+                    KDefine(name) ->
+                        val inner = to_end(b, at, "define")?
+
+                        if b.defines.has(name) then
+                            return Err(error(at, s"the block `$name` is defined twice in this template"))
+
+                        b.defines.put(name, inner)
+                        nodes.push(Define(name))
+                    KBlock(name, e) -> nodes.push(Block(at, name, e, to_end(b, at, "block")?))
+
+    Ok((nodes, SEof))
+end body
+
+// `if`, its `elsif`s, an `else`, and the `end`.
+private if_block(b: *Builder, at: Span, cond: Expr) -> Result[Node, Diagnostic]
+    val arms: Buf[Arm] = buf()
+    var test = cond
+
+    loop
+        val (nodes, stop) = body(b)?
+
+        arms.push(Arm(one(test), nodes))
+
+        stop match
+            SElsif(_, e) -> test = e
+            SElse(_) -> return Ok(If(arms, Some(to_end(b, at, "if")?)))
+            SEnd(_) -> return Ok(If(arms, None))
+            SEof -> return Err(unclosed_block(at, "if"))
+            SCase(_, _) -> return Err(stray(stop))
+end if_block
+
+// `match`, its `case`s, an `else`, and the `end`. What comes between `match` and the first `case`
+// can only be whitespace, since there is no arm for anything else to belong to.
+private match_block(b: *Builder, at: Span, subject: Expr) -> Result[Node, Diagnostic]
+    val (lead, first) = body(b)?
+
+    for n in lead
+        n match
+            Text(t) -> if t.trim().len > 0 then
+                return Err(error(at, "only whitespace may come between `match` and its first `case`"))
+            _ -> return Err(error(at, "only whitespace may come between `match` and its first `case`"))
+
+    val arms: Buf[Arm] = buf()
+    var stop = first
+
+    loop
+        stop match
+            SCase(_, es) ->
+                val (nodes, next) = body(b)?
+
+                arms.push(Arm(es, nodes))
+                stop = next
+            SElse(_) -> return Ok(Match(at, subject, arms, Some(to_end(b, at, "match")?)))
+            SEnd(_) -> return Ok(Match(at, subject, arms, None))
+            SEof -> return Err(unclosed_block(at, "match"))
+            SElsif(_, _) -> return Err(stray(stop))
+end match_block
+
+// A body that may have an `else` before its `end`: `for` and `with`.
+private with_else(b: *Builder, at: Span, what: string) -> Result[(Buf[Node], Option[Buf[Node]]), Diagnostic]
+    val (nodes, stop) = body(b)?
+
+    stop match
+        SEnd(_) -> Ok((nodes, None))
+        SElse(_) -> Ok((nodes, Some(to_end(b, at, what)?)))
+        SEof -> Err(unclosed_block(at, what))
+        _ -> Err(stray(stop))
+
+// A body that ends at `end` and nowhere else.
+private to_end(b: *Builder, at: Span, what: string) -> Result[Buf[Node], Diagnostic]
+    val (nodes, stop) = body(b)?
+
+    stop match
+        SEnd(_) -> Ok(nodes)
+        SEof -> Err(unclosed_block(at, what))
+        _ -> Err(stray(stop))
+
+private unclosed_block(at: Span, what: string) -> Diagnostic =
+    error(at, s"this `$what` is never closed").with_label("no `{{ end }}` for it before the template ends")
+
+// A tag that divides or ends a block, met where there is no such block.
+private stray(stop: Stop) -> Diagnostic = stop match
+    SEnd(at) -> error(at, "there is no block for this `end` to close")
+    SElse(at) -> error(at, "this `else` belongs to no `if`, `for`, `with` or `match`")
+    SElsif(at, _) -> error(at, "this `elsif` belongs to no `if`")
+    SCase(at, _) -> error(at, "this `case` belongs to no `match`")
+    SEof -> error(Span(0, 0), "the template ended")
+
+private one(e: Expr) -> Buf[Expr]
+    val xs: Buf[Expr] = buf()
+
+    xs.push(e)
+    xs
+
+// -- tags ------------------------------------------------------------------------------------------
+
+private enum Kind
+    KOut(e: Expr)
+    KAssign(name: string, e: Expr)
+    KReturn(e: Option[Expr])
+    KIf(e: Expr)
+    KElsif(e: Expr)
+    KElse
+    KEnd
+    KFor(first: string, second: string, e: Expr)
+    KWith(e: Expr)
+    KMatch(e: Expr)
+    KCase(es: Buf[Expr])
+    KDefine(name: string)
+    KBlock(name: string, e: Expr)
+
+/** The parser's place in one tag's tokens. */
+private[squiggly] struct P
+    src: Source
+    toks: Buf[Token]
+    i: usize
+
+    // Inside a backtick quote, where the next backtick closes it and cannot begin an argument.
+    quoting: bool
+
+    peek(self) -> Token = self.toks[self.i]
+
+    peek_at(self, n: usize) -> Token =
+        if self.i + n < self.toks.len() then self.toks[self.i + n] else self.toks[self.toks.len() - 1]
+
+    next(*self) -> Token
+        val t = self.toks[self.i]
+
+        if self.i + 1 < self.toks.len() then self.i += 1
+
+        t
+
+    // Whether the next token is this symbol, taking it if so.
+    sym(*self, s: string) -> bool
+        if is_sym(self.peek(), s) then
+            self.next()
+            return true
+
+        false
+
+    // Whether the next token is this keyword, taking it if so.
+    word(*self, w: string) -> bool
+        if is_word(self.peek(), w) then
+            self.next()
+            return true
+
+        false
+
+    // Where the last token taken ended, for a span running from some start to here.
+    from(self, start: Span) -> Span
+        val last = if self.i > 0 then self.toks[self.i - 1].at else start
+
+        Span(start.start, if last.end > start.start then last.end else start.end)
+end P
+
+private is_sym(t: Token, s: string) -> bool = t.tok match
+    Sym(x) -> x == s
+    _ -> false
+
+private is_word(t: Token, w: string) -> bool = t.tok match
+    Word(x) -> x == w
+    _ -> false
+
+private is_close(t: Token) -> bool = t.tok match
+    Close -> true
+    _ -> false
+
+// A name the program chose, which is any word but a keyword.
+private name_of(t: Token) -> Option[string] = t.tok match
+    Word(x) -> if is_reserved(x) then None else Some(x)
+    _ -> None
+
+private tag_kind(src: Source, toks: Buf[Token]) -> Result[Kind, Diagnostic]
+    var p = P(src, toks, 0, false)
+    val k = kind(&p)?
+
+    if !is_close(p.peek()) then return Err(unexpected(p.peek(), "the end of the tag"))
+
+    Ok(k)
+
+private kind(p: *P) -> Result[Kind, Diagnostic]
+    val t = p.peek()
+
+    if is_close(t) then return Err(expected(t.at, "something inside the tag", "an empty tag")
+        .with_note("a comment is written `{{// … }}`"))
+
+    if p.word("end") then return Ok(KEnd)
+
+    if p.word("else") then
+        if p.word("if") then return Ok(KElsif(expr(p)?))
+
+        return Ok(KElse)
+
+    if p.word("elsif") then return Ok(KElsif(expr(p)?))
+    if p.word("with") then return Ok(KWith(expr(p)?))
+    if p.word("match") then return Ok(KMatch(expr(p)?))
+
+    if p.word("case") then
+        val es: Buf[Expr] = buf()
+
+        es.push(expr(p)?)
+
+        while p.sym(",") do es.push(expr(p)?)
+
+        return Ok(KCase(es))
+
+    if p.word("define") then return Ok(KDefine(block_name(p, "define")?))
+
+    if p.word("block") then
+        val name = block_name(p, "block")?
+        val e = if is_close(p.peek()) then Path(p.peek().at, false, buf()) else expr(p)?
+
+        return Ok(KBlock(name, e))
+
+    if p.word("return") then
+        if is_close(p.peek()) then return Ok(KReturn(None))
+
+        return Ok(KReturn(Some(expr(p)?)))
+
+    if p.word("for") then return for_tag(p)
+
+    if p.word("if") then
+        // `{{ if c }}` opens a block; `{{ if c then a else b }}` is an expression that prints.
+        val c = or_expr(p)?
+
+        if p.word("then") then return Ok(KOut(cond_rest(p, t.at, c)?))
+
+        return Ok(KIf(c))
+
+    name_of(t) match
+        Some(n) -> if is_sym(p.peek_at(1), ":=") then
+            p.next()
+            p.next()
+            return Ok(KAssign(n, expr(p)?))
+        None -> ()
+
+    Ok(KOut(expr(p)?))
+end kind
+
+private block_name(p: *P, what: string) -> Result[string, Diagnostic]
+    val t = p.next()
+
+    t.tok match
+        Word(w) -> Ok(w)
+        _ -> Err(expected(t.at, s"the name of the block after `$what`", found(t)))
+
+// `for x <- e`, `for x, i <- e`, `for k, v <- e`, or `for e` with only `.` bound.
+private for_tag(p: *P) -> Result[Kind, Diagnostic]
+    name_of(p.peek()) match
+        Some(first) ->
+            if is_sym(p.peek_at(1), "<-") then
+                p.next()
+                p.next()
+                return Ok(KFor(first, "", expr(p)?))
+
+            if is_sym(p.peek_at(1), ",") then
+                name_of(p.peek_at(2)) match
+                    Some(second) -> if is_sym(p.peek_at(3), "<-") then
+                        p.next()
+                        p.next()
+                        p.next()
+                        p.next()
+                        return Ok(KFor(first, second, expr(p)?))
+                    None -> ()
+        None -> ()
+
+    Ok(KFor("", "", expr(p)?))
+end for_tag
+
+// -- expressions -----------------------------------------------------------------------------------
+
+/** One expression, the loosest kind there is. */
+private[squiggly] expr(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+
+    if p.word("if") then
+        val c = or_expr(p)?
+
+        if !p.word("then") then return Err(unexpected(p.peek(), "`then`"))
+
+        return cond_rest(p, start, c)
+
+    or_expr(p)
+
+// The rest of `if c then a else b`, with `then` taken. Without an `else` the value is `null`.
+private cond_rest(p: *P, start: Span, c: Expr) -> Result[Expr, Diagnostic]
+    val yes = expr(p)?
+
+    if p.word("else") then
+        val no = expr(p)?
+
+        return Ok(Cond(p.from(start), c, yes, Some(no)))
+
+    Ok(Cond(p.from(start), c, yes, None))
+
+private or_expr(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    var l = and_expr(p)?
+
+    while p.word("or")
+        val r = and_expr(p)?
+
+        l = Bin(p.from(start), Or, l, r)
+
+    Ok(l)
+
+private and_expr(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    var l = not_expr(p)?
+
+    while p.word("and")
+        val r = not_expr(p)?
+
+        l = Bin(p.from(start), And, l, r)
+
+    Ok(l)
+
+private not_expr(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+
+    if p.word("not") then
+        val e = not_expr(p)?
+
+        return Ok(Not(p.from(start), e))
+
+    compare(p)
+
+private cmp_of(t: Token) -> Option[Cmp] = t.tok match
+    Sym(x) -> x match
+        "=" -> Some(Eq)
+        "!=" -> Some(Ne)
+        "<" -> Some(Lt)
+        "<=" -> Some(Le)
+        ">" -> Some(Gt)
+        ">=" -> Some(Ge)
+        _ -> None
+    Word(x) -> if x == "div" then Some(Divides) else None
+    _ -> None
+
+private compare(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    val first = pipe(p)?
+    val ops: Buf[Cmp] = buf()
+    val rest: Buf[Expr] = buf()
+
+    loop
+        cmp_of(p.peek()) match
+            Some(c) ->
+                p.next()
+                ops.push(c)
+                rest.push(pipe(p)?)
+            None -> break
+
+    if ops.len() == 0 then return Ok(first)
+
+    Ok(Compare(p.from(start), first, ops, rest))
+end compare
+
+// `x | f a b` is `f a b x`, and a pipe chains: `x | f | g a` is `g a (f x)`.
+private pipe(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    var l = additive(p)?
+
+    while p.sym("|")
+        val t = p.next()
+        val name = name_of(t) match
+            Some(n) -> n
+            None -> return Err(expected(t.at, "the name of a function after `|`", found(t)))
+
+        val args = arguments(p)?
+
+        args.push(l)
+        l = Call(p.from(start), name, args)
+
+    Ok(l)
+end pipe
+
+private additive(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    var l = multiplicative(p)?
+
+    loop
+        val t = p.peek()
+
+        val op =
+            if is_sym(t, "+") then Some(Add)
+            elif is_sym(t, "-") then Some(Sub)
+            elif is_sym(t, "++") then Some(Concat)
+            else None
+
+        op match
+            Some(o) ->
+                p.next()
+
+                val r = multiplicative(p)?
+
+                l = Bin(p.from(start), o, l, r)
+            None -> t.tok match
+                // `n -1` after an operand that cannot take arguments is a subtraction.
+                NegNumber(v) ->
+                    p.next()
+
+                    val r = Lit(Span(t.at.start + 1, t.at.end), negate_lit(v))
+                    val rhs = mul_tail(p, pow_tail(p, r)?)?
+
+                    l = Bin(p.from(start), Sub, l, rhs)
+                _ -> break
+
+    Ok(l)
+end additive
+
+private negate_lit(v: Value) -> Value = v match
+    Int(n) -> Int(-n)
+    Real(x) -> Real(-x)
+    _ -> v
+
+private multiplicative(p: *P) -> Result[Expr, Diagnostic]
+    val l = unary(p)?
+
+    mul_tail(p, l)
+
+private mul_tail(p: *P, first: Expr) -> Result[Expr, Diagnostic]
+    val start = first.span()
+    var l = first
+
+    loop
+        val t = p.peek()
+
+        val op =
+            if is_sym(t, "*") then Some(Mul)
+            elif is_sym(t, "/") then Some(Div)
+            elif is_sym(t, "\\") then Some(Quot)
+            elif is_word(t, "mod") then Some(Mod)
+            else None
+
+        op match
+            Some(o) ->
+                p.next()
+
+                val r = unary(p)?
+
+                l = Bin(p.from(start), o, l, r)
+            None -> break
+
+    Ok(l)
+end mul_tail
+
+private unary(p: *P) -> Result[Expr, Diagnostic]
+    val t = p.peek()
+
+    if p.sym("-") then
+        val e = unary(p)?
+
+        return Ok(Neg(p.from(t.at), e))
+
+    t.tok match
+        // `-2 ^ 2` is `-(2 ^ 2)`, as it is in arithmetic, though the lexer read `-2` as one token.
+        NegNumber(v) ->
+            p.next()
+
+            val e = pow_tail(p, Lit(Span(t.at.start + 1, t.at.end), negate_lit(v)))?
+
+            return Ok(Neg(p.from(t.at), e))
+        _ -> ()
+
+    pow_tail(p, application(p)?)
+end unary
+
+// `b ^ e`, right-associative, with the exponent a unary so that `2 ^ -2` reads.
+private pow_tail(p: *P, base: Expr) -> Result[Expr, Diagnostic]
+    if p.sym("^") then
+        val e = unary(p)?
+
+        return Ok(Bin(p.from(base.span()), Pow, base, e))
+
+    Ok(base)
+
+// A name followed by arguments is a call; anything else is an operand.
+private application(p: *P) -> Result[Expr, Diagnostic]
+    val t = p.peek()
+
+    name_of(t) match
+        Some(n) -> if starts_argument(p.peek_at(1), p.quoting) then
+            p.next()
+
+            val args = arguments(p)?
+
+            return Ok(Call(p.from(t.at), n, args))
+        None -> ()
+
+    postfix(p)
+
+// The arguments after a function's name, as many as there are.
+private arguments(p: *P) -> Result[Buf[Expr], Diagnostic]
+    val args: Buf[Expr] = buf()
+
+    while starts_argument(p.peek(), p.quoting)
+        val t = p.peek()
+
+        t.tok match
+            NegNumber(v) ->
+                p.next()
+                args.push(Lit(t.at, v))
+            _ -> args.push(postfix(p)?)
+
+    Ok(args)
+
+// Whether a token can begin an argument. A `[` or a `.` written hard against what came before is a
+// subscript or a field of it, not a new argument; a backtick inside a quote is the quote's end.
+private starts_argument(t: Token, quoting: bool) -> bool = t.tok match
+    Number(_) -> true
+    NegNumber(_) -> true
+    Text(_) -> true
+    Word(w) -> !is_reserved(w) || w == "true" || w == "false" || w == "null"
+    Sym(x) -> x match
+        "(" -> true
+        "{" -> true
+        "`" -> !quoting
+        "$" -> true
+        "[" -> t.spaced
+        "." -> t.spaced
+        _ -> false
+    Close -> false
+
+// An operand and the fields and subscripts written onto it.
+private postfix(p: *P) -> Result[Expr, Diagnostic]
+    val start = p.peek().at
+    var e = primary(p)?
+
+    loop
+        val t = p.peek()
+
+        if t.spaced then break
+
+        if is_sym(t, ".") then
+            p.next()
+
+            val n = p.next()
+
+            n.tok match
+                Word(w) -> if n.spaced then
+                    return Err(expected(n.at, "a field name written straight after the `.`", "a space"))
+                else
+                    e = Field(p.from(start), e, w)
+                _ -> return Err(expected(n.at, "a field name after `.`", found(n)))
+        elif is_sym(t, "[") then
+            p.next()
+
+            val i = expr(p)?
+
+            if !p.sym("]") then return Err(unexpected(p.peek(), "`]`"))
+
+            e = Index(p.from(start), e, i)
+        else
+            break
+
+    Ok(e)
+end postfix
+
+private primary(p: *P) -> Result[Expr, Diagnostic]
+    val t = p.next()
+
+    t.tok match
+        Number(v) -> Ok(Lit(t.at, v))
+        NegNumber(v) -> Ok(Lit(t.at, v))
+        Text(s) -> Ok(Lit(t.at, Str(s)))
+        Word(w) -> w match
+            "true" -> Ok(Lit(t.at, Bool(true)))
+            "false" -> Ok(Lit(t.at, Bool(false)))
+            "null" -> Ok(Lit(t.at, Null))
+            _ -> if is_reserved(w) then Err(expected(t.at, "an expression", s"the keyword `$w`")) else Ok(Var(t.at, w))
+        Sym(x) -> x match
+            "." -> Ok(path(p, t.at, false))
+            "$" ->
+                val n = p.peek()
+
+                if !n.spaced then
+                    n.tok match
+                        Word(w) ->
+                            p.next()
+                            return Ok(GVar(p.from(t.at), w))
+                        Sym(d) -> if d == "." then
+                            p.next()
+                            return Ok(path(p, t.at, true))
+                        _ -> ()
+
+                Ok(Path(t.at, true, buf()))
+            "(" ->
+                val e = expr(p)?
+
+                if !p.sym(")") then return Err(unexpected(p.peek(), "`)`"))
+
+                Ok(e)
+            "[" ->
+                val items: Buf[Expr] = buf()
+
+                if !p.sym("]") then
+                    loop
+                        items.push(expr(p)?)
+
+                        if p.sym("]") then break
+                        if !p.sym(",") then return Err(unexpected(p.peek(), "`,` or `]`"))
+
+                Ok(ListLit(p.from(t.at), items))
+            "{" -> map_literal(p, t.at)
+            "`" ->
+                if p.quoting then return Err(error(t.at, "a lambda cannot be written inside another"))
+
+                p.quoting = true
+
+                val e = expr(p)?
+
+                p.quoting = false
+
+                if !p.sym("`") then return Err(unexpected(p.peek(), "the closing backtick"))
+
+                Ok(Quote(p.from(t.at), e))
+            _ -> Err(expected(t.at, "an expression", found(t)))
+        Close -> Err(expected(t.at, "an expression", found(t)))
+end primary
+
+// `.`, `.a`, `.a.b` -- the dot already taken. The names after the first are joined to it by dots
+// written with no space, as the first is.
+private path(p: *P, at: Span, root: bool) -> Expr
+    val names: Buf[string] = buf()
+    var t = p.peek()
+
+    if !t.spaced then
+        t.tok match
+            Word(w) ->
+                p.next()
+                names.push(w)
+
+                loop
+                    val d = p.peek()
+                    val n = p.peek_at(1)
+
+                    if d.spaced || n.spaced || !is_sym(d, ".") then break
+
+                    n.tok match
+                        Word(w2) ->
+                            p.next()
+                            p.next()
+                            names.push(w2)
+                        _ -> break
+            _ -> ()
+
+    Path(p.from(at), root, names)
+end path
+
+// `{a: 1, 'b c': 2}` -- the opening brace already taken. A key is a name or a string.
+private map_literal(p: *P, at: Span) -> Result[Expr, Diagnostic]
+    val keys: Buf[string] = buf()
+    val vals: Buf[Expr] = buf()
+
+    if p.sym("}") then return Ok(MapLit(p.from(at), keys, vals))
+
+    loop
+        val k = p.next()
+
+        k.tok match
+            Word(w) -> keys.push(w)
+            Text(s) -> keys.push(s)
+            _ -> return Err(expected(k.at, "a key", found(k)))
+
+        if !p.sym(":") then return Err(unexpected(p.peek(), "`:`"))
+
+        vals.push(expr(p)?)
+
+        if p.sym("}") then break
+        if !p.sym(",") then return Err(unexpected(p.peek(), "`,` or `}`"))
+
+    Ok(MapLit(p.from(at), keys, vals))
+end map_literal
+
+private unexpected(t: Token, want: string) -> Diagnostic = expected(t.at, want, found(t))
+
+// What a token is, as a diagnostic says what was found instead.
+private found(t: Token) -> string = t.tok match
+    Word(w) -> s"`$w`"
+    Number(_) -> "a number"
+    NegNumber(_) -> "a number"
+    Text(_) -> "a string"
+    Sym(x) -> s"`$x`"
+    Close -> "the end of the tag"

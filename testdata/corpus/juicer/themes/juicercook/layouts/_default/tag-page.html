@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>#{{ .term.name }} — {{ .site.title }}</title>
+  {{ if .site.favicon }}<link rel="icon" href="{{ relURL .site.favicon }}">{{ end }}
+
+  <script>
+    (function() {
+      try {
+        var stored = localStorage.getItem('juicer-theme');
+        var dark = stored
+          ? stored === 'dark'
+          : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="{{ relURL '/juicercook.css' }}">
+
+  {{ if .site.juicercook }}
+  <style>
+    :root {
+      {{ if .site.juicercook.brand }}--brand: {{ .site.juicercook.brand }};{{ end }}
+      {{ if .site.juicercook.brandStrong }}--brand-strong: {{ .site.juicercook.brandStrong }};{{ end }}
+      {{ if .site.juicercook.brandSoft }}--brand-soft: {{ .site.juicercook.brandSoft }};{{ end }}
+      {{ if .site.juicercook.accent }}--accent: {{ .site.juicercook.accent }};{{ end }}
+      {{ if .site.juicercook.fontSans }}--font-sans: {{ .site.juicercook.fontSans }};{{ end }}
+      {{ if .site.juicercook.fontSerif }}--font-serif: {{ .site.juicercook.fontSerif }};{{ end }}
+    }
+    [data-theme="dark"] {
+      {{ if .site.juicercook.brandDark }}--brand: {{ .site.juicercook.brandDark }};{{ end }}
+      {{ if .site.juicercook.accentDark }}--accent: {{ .site.juicercook.accentDark }};{{ end }}
+    }
+  </style>
+  {{ end }}
+</head>
+<body>
+  <div class="juicercook-page">
+    {{ partial 'topbar' . }}
+    <main class="juicercook-main">
+      <article class="juicercook-section">
+        <header class="juicercook-section-head">
+          <h1 class="juicercook-section-title">#{{ .term.name }}</h1>
+          <p class="juicercook-section-summary">{{ .term.count }} recipes</p>
+        </header>
+        {{ if .term.pages }}
+        <section class="juicercook-cards">
+          {{ for p <- .term.pages }}{{ partial 'recipe-card' p }}{{ end }}
+        </section>
+        {{ end }}
+      </article>
+    </main>
+    {{ partial 'footer' . }}
+  </div>
+</body>
+</html>

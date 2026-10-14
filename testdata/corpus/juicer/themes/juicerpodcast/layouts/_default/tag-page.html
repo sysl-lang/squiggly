@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>#{{ .term.name }} — {{ .site.title }}</title>
+  {{ if .site.favicon }}<link rel="icon" href="{{ relURL .site.favicon }}">{{ end }}
+
+  <script>
+    (function() {
+      try {
+        var stored = localStorage.getItem('juicer-theme');
+        var dark = stored
+          ? stored === 'dark'
+          : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="{{ relURL '/juicerpodcast.css' }}">
+
+  {{ if .site.juicerpodcast }}
+  <style>
+    :root {
+      {{ if .site.juicerpodcast.brand }}--brand: {{ .site.juicerpodcast.brand }};{{ end }}
+      {{ if .site.juicerpodcast.brandStrong }}--brand-strong: {{ .site.juicerpodcast.brandStrong }};{{ end }}
+      {{ if .site.juicerpodcast.brandSoft }}--brand-soft: {{ .site.juicerpodcast.brandSoft }};{{ end }}
+      {{ if .site.juicerpodcast.accent }}--accent: {{ .site.juicerpodcast.accent }};{{ end }}
+      {{ if .site.juicerpodcast.fontSans }}--font-sans: {{ .site.juicerpodcast.fontSans }};{{ end }}
+      {{ if .site.juicerpodcast.fontSerif }}--font-serif: {{ .site.juicerpodcast.fontSerif }};{{ end }}
+    }
+    [data-theme="dark"] {
+      {{ if .site.juicerpodcast.brandDark }}--brand: {{ .site.juicerpodcast.brandDark }};{{ end }}
+      {{ if .site.juicerpodcast.accentDark }}--accent: {{ .site.juicerpodcast.accentDark }};{{ end }}
+    }
+  </style>
+  {{ end }}
+</head>
+<body>
+  <div class="juicerpodcast-page">
+    {{ partial 'topbar' . }}
+    <main class="juicerpodcast-main">
+      <article class="juicerpodcast-section">
+        <header class="juicerpodcast-section-head">
+          <h1 class="juicerpodcast-section-title">#{{ .term.name }}</h1>
+          <p class="juicerpodcast-section-summary">{{ .term.count }} episodes</p>
+        </header>
+        {{ if .term.pages }}
+        <section class="juicerpodcast-episodes">
+          {{ for p <- .term.pages }}
+          <article class="juicerpodcast-card">
+            <a class="juicerpodcast-card-figure" href="{{ p.url }}" aria-hidden="true">
+              {{ if p.image }}<img src="{{ relURL p.image }}" alt="" loading="lazy">{{ else }}<div class="juicerpodcast-card-figure-placeholder">▶</div>{{ end }}
+            </a>
+            <div class="juicerpodcast-card-body">
+              <h2 class="juicerpodcast-card-title"><a href="{{ p.url }}">{{ if p.title }}{{ p.title }}{{ else }}Untitled{{ end }}</a></h2>
+              {{ if p.summary }}<p class="juicerpodcast-card-summary">{{ p.summary }}</p>{{ end }}
+              <p class="juicerpodcast-card-meta">{{ if p.dateLong }}<time datetime="{{ p.dateISO }}">{{ p.dateLong }}</time>{{ end }}{{ if p.duration }}{{ if p.dateLong }} · {{ end }}<span>{{ p.duration }}</span>{{ end }}</p>
+            </div>
+          </article>
+          {{ end }}
+        </section>
+        {{ end }}
+      </article>
+    </main>
+    {{ partial 'footer' . }}
+  </div>
+</body>
+</html>

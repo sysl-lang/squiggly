@@ -1,0 +1,310 @@
+module sh.sysl.squiggly
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The ports of Scala squiggly's IfTests, MatchTests, ForTests, WithTests, ReturnTests and
+// DefineBlockTests, and what the block structure refuses.
+
+// -- if ---------------------------------------------------------------------------------------------
+
+@test("if, else, as Scala squiggly's suite has it")
+if_else()
+    assert_eq(run(Null, "[{{ if true }}yes{{ end }}]"), "[yes]")
+    assert_eq(run(Null, "[{{ if true }}yes{{ else }}no{{ end }}]"), "[yes]")
+    assert_eq(run(Null, "[{{ if false }}yes{{ end }}]"), "[]")
+    assert_eq(run(Null, "[{{ if false }}yes{{ else }}no{{ end }}]"), "[no]")
+
+@test("elsif chains take the first true arm, as Scala squiggly's suite has them")
+elsif_chains()
+    val two_with_else = "[{{ if . = 3 }}three{{ elsif . = 4 }}four{{ else }}none{{ end }}]"
+    val two = "[{{ if . = 3 }}three{{ elsif . = 4 }}four{{ end }}]"
+    val three_with_else = "[{{ if . = 3 }}three{{ elsif . = 4 }}four{{ elsif . = 5 }}five{{ else }}none{{ end }}]"
+    val three = "[{{ if . = 3 }}three{{ elsif . = 4 }}four{{ elsif . = 5 }}five{{ end }}]"
+    val cases: []const (string, long, string) = [
+        (two_with_else, 3, "[three]"), (two_with_else, 4, "[four]"), (two_with_else, 5, "[none]"),
+        (two, 3, "[three]"), (two, 4, "[four]"), (two, 5, "[]"),
+        (three_with_else, 3, "[three]"), (three_with_else, 4, "[four]"), (three_with_else, 5, "[five]"),
+        (three_with_else, 6, "[none]"),
+        (three, 3, "[three]"), (three, 4, "[four]"), (three, 5, "[five]"), (three, 6, "[]")]
+
+    for (t, n, want) in cases do assert_eq(run(Int(n), t), want)
+
+@test("`else if` is `elsif` spelled the other way")
+else_if()
+    assert_eq(run(Int(4), "[{{ if . = 3 }}three{{ else if . = 4 }}four{{ else }}none{{ end }}]"), "[four]")
+
+@test("an if nests inside an if")
+nested_if()
+    assert_eq(run(Int(2), "{{ if . > 0 }}{{ if . > 1 }}big{{ else }}small{{ end }}{{ end }}"), "big")
+
+// -- match ------------------------------------------------------------------------------------------
+
+@test("match takes the first case equal to the subject, as Scala squiggly's suite has it")
+match_cases()
+    val one = "[{{ match . }}{{ case 3 }}three{{ end }}]"
+    val one_else = "[{{ match . }}{{ case 3 }}three{{ else }}no{{ end }}]"
+    val two_else = "[{{ match . }}{{ case 3 }}three{{ case 4 }}four{{ else }}none{{ end }}]"
+    val two = "[{{ match . }}{{ case 3 }}three{{ case 4 }}four{{ end }}]"
+    val three_else = "[{{ match . }}{{ case 3 }}three{{ case 4 }}four{{ case 5 }}five{{ else }}none{{ end }}]"
+    val three = "[{{match . }}{{ case 3 }}three{{ case 4 }}four{{ case 5 }}five{{ end }}]"
+    val cases: []const (string, long, string) = [
+        (one, 3, "[three]"), (one, 4, "[]"), (one_else, 3, "[three]"), (one_else, 4, "[no]"),
+        (two_else, 3, "[three]"), (two_else, 4, "[four]"), (two_else, 5, "[none]"),
+        (two, 3, "[three]"), (two, 4, "[four]"), (two, 5, "[]"),
+        (three_else, 3, "[three]"), (three_else, 4, "[four]"), (three_else, 5, "[five]"), (three_else, 6, "[none]"),
+        (three, 3, "[three]"), (three, 4, "[four]"), (three, 5, "[five]"), (three, 6, "[]")]
+
+    for (t, n, want) in cases do assert_eq(run(Int(n), t), want)
+
+@test("a case may name several values")
+case_several_values()
+    val t = "{{ for . }}{{ match . }}{{ case 1, 2 }}low{{ case 3 }}three{{ else }}high{{ end }} {{ end }}"
+
+    assert_eq(run(json_value("[1, 2, 3, 4]"), t), "low low three high ")
+
+@test("only whitespace may come between match and its first case")
+match_lead_is_whitespace()
+    assert_eq(run(Int(1), "{{ match . }}\n  {{ case 1 }}one{{ end }}"), "one")
+    assert_eq(bad(Int(1), "{{ match . }}oops{{ case 1 }}one{{ end }}"),
+        "only whitespace may come between `match` and its first `case`")
+
+// -- for --------------------------------------------------------------------------------------------
+
+@test("for over a list, with no name, one name, and two")
+for_list()
+    val data = json_value("{\"l\": [3, 4]}")
+
+    assert_eq(run(data, "{{ for .l }}{{ . }}{{ end }}"), "34")
+    assert_eq(run(data, "{{ for i <- .l }}[{{ i }}, {{ . }}]{{ end }}"), "[3, 3][4, 4]")
+    assert_eq(run(data, "{{ for e, i <- .l }}[{{ i }}, {{ e }}, {{ . }}]{{ end }}"), "[0, 3, 3][1, 4, 4]")
+
+@test("for over a map visits its values in order, or keys and values with two names")
+for_map()
+    val data = json_value("{\"a\": 3, \"b\": 4, \"c\": 5}")
+
+    assert_eq(run(data, "{{ for . }}{{ . }}{{ end }}"), "345")
+    assert_eq(run(data, "{{ for v <- . }}{{ v }}{{ end }}"), "345")
+    assert_eq(run(data, "{{ for k, v <- . }}<{{ k }}, {{ v }}>{{ end }}"), "<a, 3><b, 4><c, 5>")
+
+@test("for over nothing runs its else")
+for_else()
+    assert_eq(run(Null, "{{ for 0 }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(Null, "{{ for false }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(Null, "{{ for '' }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(json_value("[]"), "{{ for . }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(json_value("{}"), "{{ for . }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(Null, "{{ for .nothing }}{{ . }}{{ else }}else{{ end }}"), "else")
+
+@test("for over a number is an error naming what it was")
+for_over_scalar()
+    assert_eq(bad(json_value("{\"a\": {\"b\": 3}}"), "{{ for .a.b }}{{ . }}{{ end }}"),
+        "`for` needs a list or a map, and this is a number")
+
+@test("the index is a number, so it compares and counts")
+for_index_compares()
+    assert_eq(run_json("{\"l\": [\"a\", \"b\", \"c\"]}",
+        "{{ for x, i <- .l }}{{ if i > 0 }}{{ if i = $.l.length - 1 }} and {{ else }}, {{ end }}{{ end }}{{ x }}{{ end }}"),
+        "a, b and c")
+
+@test("a variable assigned inside a loop is the same variable as outside it")
+loop_counts()
+    assert_eq(run(Null, "{{ shown := 0 }}{{ for [5, 6, 7] }}{{ if shown < 2 }}{{ . }}{{ shown := shown + 1 }}{{ end }}{{ end }}|{{ shown }}"),
+        "56|2")
+
+@test("range counts")
+range_counts()
+    assert_eq(run(Null, "{{ for range 3 }}{{ . }}{{ end }} {{ range 2 5 }}"), "012 [2, 3, 4]")
+
+// -- with -------------------------------------------------------------------------------------------
+
+@test("with binds the dot, or runs its else when the value is false")
+with_blocks()
+    assert_eq(run(Null, "{{ with 123 }}{{ . }}{{ end }}"), "123")
+    assert_eq(run_json("{\"a\": {\"b\": 3}}", "{{ with .a.b }}{{ . }}{{ end }}"), "3")
+    assert_eq(run(Int(123), "{{ with . }}{{ . }}{{ end }}"), "123")
+    assert_eq(run(Null, "{{ with 0 }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(Null, "{{ with false }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(Null, "{{ with '' }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(json_value("[]"), "{{ with . }}{{ . }}{{ else }}else{{ end }}"), "else")
+    assert_eq(run(json_value("{}"), "{{ with . }}{{ . }}{{ else }}else{{ end }}"), "else")
+
+@test("the dot comes back after a with or a for")
+dot_restored()
+    assert_eq(run(Int(1), "{{ with 2 }}{{ . }}{{ end }}{{ . }}{{ for [3] }}{{ . }}{{ end }}{{ . }}"), "2131")
+
+// -- return -----------------------------------------------------------------------------------------
+
+private returned(data: Value, text: string) -> Rendered
+    val t = parse("t", text).unwrap()
+
+    engine().run(t, data, t).unwrap()
+
+@test("a bare return stops the render")
+bare_return()
+    val r = returned(Null, "before {{ return }}after")
+
+    assert_eq(r.text, "before ")
+    assert(r.value == Null)
+
+@test("return hands back a value")
+return_value()
+    assert(returned(Null, "{{ return 42 }}").value == Int(42))
+
+@test("return inside a for stops every iteration")
+return_in_for()
+    val r = returned(Null, "{{ for n <- [1, 2, 3] }}{{ if n = 2 }}{{ return n }}{{ end }}{{ end }}")
+
+    assert_eq(r.text, "")
+    assert(r.value == Int(2))
+
+@test("return inside a with stops the render and hands back a value")
+return_in_with()
+    val r = returned(Null, "before{{ with 7 }}{{ return . }}{{ end }}after")
+
+    assert_eq(r.text, "before")
+    assert(r.value == Int(7))
+
+// -- define, block, partials ------------------------------------------------------------------------
+
+@test("a block renders its own body where nothing defines it")
+block_default()
+    assert_eq(run(Null, "{{ block greeting 'Ed' }}Hello, {{ . }}!{{ end }}"), "Hello, Ed!")
+
+@test("a define in the same template overrides the block, wherever it is written")
+block_overridden()
+    assert_eq(run(Null, "{{ define greeting }}Hi there, {{ . }}.{{ end }}{{ block greeting 'Ed' }}Hello, {{ . }}!{{ end }}"),
+        "Hi there, Ed.")
+    assert_eq(run(Null, "{{ block greeting 'Ed' }}Hello, {{ . }}!{{ end }}{{ define greeting }}Hi there, {{ . }}.{{ end }}"),
+        "Hi there, Ed.")
+
+@test("a define prints nothing where it is written")
+define_is_silent()
+    assert_eq(run(Null, "{{ define unused }}should not appear{{ end }}before-after"), "before-after")
+
+@test("a block with no expression passes the dot")
+block_passes_dot()
+    assert_eq(run(Int(5), "{{ block main }}[{{ . }}]{{ end }}"), "[5]")
+
+@test("render_layout fills a layout's blocks from a page")
+layout_from_page()
+    val layout = parse("baseof.html", "<main>{{ block main . }}default{{ end }}</main><footer>{{ block footer . }}foot{{ end }}</footer>").unwrap()
+    val page = parse("page.html", "{{ define main }}page {{ .title }}{{ end }}ignored text").unwrap()
+    val data = new_obj()
+
+    data.put("title", Str("T"))
+    assert_eq(engine().render_layout(layout, page, data).unwrap(), "<main>page T</main><footer>foot</footer>")
+
+@test("a page's blocks do not leak into the next page's render")
+layout_does_not_leak()
+    val layout = parse("baseof.html", "{{ block main . }}default{{ end }}").unwrap()
+    val first = parse("a.html", "{{ define main }}first{{ end }}").unwrap()
+    val second = parse("b.html", "no defines").unwrap()
+    val e = engine()
+
+    assert_eq(e.render_layout(layout, first, Null).unwrap(), "first")
+    assert_eq(e.render_layout(layout, second, Null).unwrap(), "default")
+
+@test("an error inside a page's block names the page, not the layout")
+block_error_names_page()
+    val layout = parse("baseof.html", "{{ block main . }}{{ end }}").unwrap()
+    val page = parse("page.html", "{{ define main }}\n{{ nosuch }}{{ end }}").unwrap()
+
+    engine().render_layout(layout, page, Null) match
+        Ok(_) -> panic("expected an error")
+        Err(e) -> assert_eq(e.place(), "page.html:2:4")
+
+@test("defining a block twice in one template is refused")
+define_twice()
+    assert_eq(bad(Null, "{{ define a }}1{{ end }}{{ define a }}2{{ end }}"), "the block `a` is defined twice in this template")
+
+// A loader over a few named templates.
+private loader_of(names: []const string, texts: []const string) -> Loader
+    val ts: Buf[Template] = buf()
+
+    for t in 0..<names.len do ts.push(parse(names[t], texts[t]).unwrap())
+
+    (name) ->
+        var found: Option[Result[Template, TemplateError]] = None
+
+        for t in ts
+            if t.name() == name then found = Some(Ok(t))
+
+        found
+
+private with_partials(names: []const string, texts: []const string, data: Value, text: string) -> Result[string, TemplateError]
+    var e = engine()
+
+    e.partials(loader_of(names, texts))
+    e.render(parse("t", text).unwrap(), data)
+
+@test("a partial renders with the data it is given")
+partial_renders()
+    assert_eq(with_partials(["greet"], ["Hello, {{ . }}!"], Str("Ed"), "{{ partial 'greet' . }}").unwrap(), "Hello, Ed!")
+
+@test("a partial with no data has null for its dot")
+partial_without_data()
+    assert_eq(with_partials(["static"], ["static body[{{ . }}]"], Null, "{{ partial 'static' }}").unwrap(), "static body[]")
+
+@test("a missing partial is an error naming it")
+partial_missing()
+    with_partials(["x"], ["x"], Null, "{{ partial 'absent' . }}") match
+        Ok(_) -> panic("expected an error")
+        Err(e) -> assert_eq(e.message(), "`partial`: there is no partial named `absent`")
+
+@test("a partial's text can be kept in a variable, and a return makes it a function")
+partial_as_value()
+    assert_eq(with_partials(["p"], ["<{{ . }}>"], Null, "{{ x := partial 'p' 1 }}[{{ x }}]").unwrap(), "[<1>]")
+    assert_eq(with_partials(["double"], ["ignored{{ return . * 2 }}"], Null, "{{ partial 'double' 21 }}").unwrap(), "42")
+
+@test("a partial's variables are its own")
+partial_scope()
+    assert_eq(with_partials(["p"], ["{{ x := 2 }}{{ x }}"], Null, "{{ x := 1 }}{{ partial 'p' }}{{ x }}").unwrap(), "21")
+
+@test("an error inside a partial names the partial's line")
+partial_error_place()
+    with_partials(["card"], ["ok\n  {{ 1 + 'a' }}"], Null, "{{ partial 'card' }}") match
+        Ok(_) -> panic("expected an error")
+        Err(e) ->
+            assert_eq(e.place(), "card:2:6")
+            assert_eq(e.message(), "`+` needs numbers, and one side is a string")
+
+@test("a partial that includes itself is stopped")
+partial_recursion()
+    with_partials(["loop"], ["{{ partial 'loop' }}"], Null, "{{ partial 'loop' }}") match
+        Ok(_) -> panic("expected an error")
+        Err(e) -> assert(e.message().contains("nested more than 64 deep"))
+
+@test("a partial sees the page's blocks")
+partial_sees_blocks()
+    var e = engine()
+
+    e.partials(loader_of(["side"], ["{{ block extra . }}none{{ end }}"]))
+
+    val layout = parse("baseof", "{{ partial 'side' }}").unwrap()
+    val page = parse("page", "{{ define extra }}some{{ end }}").unwrap()
+
+    assert_eq(e.render_layout(layout, page, Null).unwrap(), "some")
+
+// -- structure errors -------------------------------------------------------------------------------
+
+@test("a block left open is an error at the tag that opened it")
+unclosed_blocks()
+    assert_eq(bad(Null, "{{ if true }}x"), "this `if` is never closed")
+    assert_eq(bad(Null, "{{ for . }}x{{ else }}y"), "this `for` is never closed")
+    assert_eq(bad(Null, "{{ with . }}"), "this `with` is never closed")
+    assert_eq(bad(Null, "{{ match . }}{{ case 1 }}"), "this `match` is never closed")
+    assert_eq(bad(Null, "{{ define a }}"), "this `define` is never closed")
+    assert_eq(bad(Null, "{{ block a . }}"), "this `block` is never closed")
+
+@test("a tag that closes or divides nothing is an error")
+stray_tags()
+    assert_eq(bad(Null, "x{{ end }}"), "there is no block for this `end` to close")
+    assert_eq(bad(Null, "x{{ else }}"), "this `else` belongs to no `if`, `for`, `with` or `match`")
+    assert_eq(bad(Null, "x{{ elsif true }}"), "this `elsif` belongs to no `if`")
+    assert_eq(bad(Null, "x{{ case 1 }}"), "this `case` belongs to no `match`")
+    assert_eq(bad(Null, "{{ for . }}{{ elsif true }}{{ end }}"), "this `elsif` belongs to no `if`")
+    assert_eq(bad(Null, "{{ if true }}{{ case 1 }}{{ end }}"), "this `case` belongs to no `match`")
+    assert_eq(bad(Null, "{{ if true }}a{{ else }}b{{ else }}c{{ end }}"),
+        "this `else` belongs to no `if`, `for`, `with` or `match`")

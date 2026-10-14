@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tags — {{ .site.title }}</title>
+  {{ if .site.favicon }}<link rel="icon" href="{{ relURL .site.favicon }}">{{ end }}
+
+  <!-- tag-list / tag-page / 404 bypass baseof, so the pre-paint theme
+       script + site palette overrides are inlined here. Same logic the
+       head partial uses for normal pages. -->
+  <script>
+    (function() {
+      try {
+        var stored = localStorage.getItem('juicer-theme');
+        var dark = stored
+          ? stored === 'dark'
+          : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="{{ relURL '/juicercook.css' }}">
+
+  {{ if .site.juicercook }}
+  <style>
+    :root {
+      {{ if .site.juicercook.brand }}--brand: {{ .site.juicercook.brand }};{{ end }}
+      {{ if .site.juicercook.brandStrong }}--brand-strong: {{ .site.juicercook.brandStrong }};{{ end }}
+      {{ if .site.juicercook.brandSoft }}--brand-soft: {{ .site.juicercook.brandSoft }};{{ end }}
+      {{ if .site.juicercook.accent }}--accent: {{ .site.juicercook.accent }};{{ end }}
+      {{ if .site.juicercook.fontSans }}--font-sans: {{ .site.juicercook.fontSans }};{{ end }}
+      {{ if .site.juicercook.fontSerif }}--font-serif: {{ .site.juicercook.fontSerif }};{{ end }}
+    }
+    [data-theme="dark"] {
+      {{ if .site.juicercook.brandDark }}--brand: {{ .site.juicercook.brandDark }};{{ end }}
+      {{ if .site.juicercook.accentDark }}--accent: {{ .site.juicercook.accentDark }};{{ end }}
+    }
+  </style>
+  {{ end }}
+</head>
+<body>
+  <div class="juicercook-page">
+    {{ partial 'topbar' . }}
+    <main class="juicercook-main">
+      <article class="juicercook-section">
+        <header class="juicercook-section-head">
+          <h1 class="juicercook-section-title">All tags</h1>
+          {{ if .terms }}<p class="juicercook-section-summary">{{ length .terms }} tags</p>{{ end }}
+        </header>
+        {{ if .terms }}
+        <ul class="juicercook-taglist">
+          {{ for t <- .terms }}
+          <li><a href="{{ t.url }}">{{ t.name }}</a> <span class="juicercook-taglist-count">{{ t.count }}</span></li>
+          {{ end }}
+        </ul>
+        {{ end }}
+      </article>
+    </main>
+    {{ partial 'footer' . }}
+  </div>
+</body>
+</html>

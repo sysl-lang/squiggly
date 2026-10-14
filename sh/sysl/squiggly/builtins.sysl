@@ -1,0 +1,919 @@
+module sh.sysl.squiggly
+
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+import sysl.regex.{regex, describe}
+import sysl.text.{Ascii, Search, parse_long, parse_real, str_builder, to_lower, to_upper}
+
+// The functions every engine starts with.
+//
+// **The argument a function works on comes last**, so that a pipe can supply it: `take 2 .pages`
+// and `.pages | take 2` are the same call. Every function here follows that, and a host defining
+// its own should too.
+//
+// **What is not here, and why**: `now` reads the clock and `random`/`shuffle` the entropy source,
+// and a site that renders differently each build cannot be checked by comparing builds -- a host
+// that wants them defines them. `markdownify` and `emojify` belong to whichever Markdown renderer and
+// emoji table the host uses, and `fileExists` to its filesystem; squiggly opens nothing.
+
+private[squiggly] add_builtins(e: Engine)
+    // numbers
+    e.define("abs", 1, 1, b_abs)
+    e.define("ceil", 1, 1, b_ceil)
+    e.define("floor", 1, 1, b_floor)
+    e.define("round", 1, 1, b_round)
+    e.define("max", 1, many, b_max)
+    e.define("min", 1, many, b_min)
+    e.define("sum", 1, 1, b_sum)
+    e.define("number", 1, 1, b_float)
+    e.define("int", 1, 1, b_int)
+    e.define("float", 1, 1, b_float)
+    e.define("bool", 1, 1, b_bool)
+    e.define("range", 1, 2, b_range)
+
+    // text
+    e.define("capitalize", 1, 1, b_capitalize)
+    e.define("lower", 1, 1, b_lower)
+    e.define("upper", 1, 1, b_upper)
+    e.define("trim", 1, 1, b_trim)
+    e.define("ltrim", 1, 1, b_ltrim)
+    e.define("rtrim", 1, 1, b_rtrim)
+    e.define("htmlEscape", 1, 1, b_html_escape)
+    e.define("newline_to_br", 1, 1, b_newline_to_br)
+    e.define("remove", 2, 2, b_remove)
+    e.define("removeFirst", 2, 2, b_remove_first)
+    e.define("replace", 3, 3, b_replace)
+    e.define("startsWith", 2, 2, b_starts_with)
+    e.define("endsWith", 2, 2, b_ends_with)
+    e.define("split", 2, 2, b_split)
+    e.define("substring", 3, 3, b_substring)
+    e.define("truncate", 2, 3, b_truncate)
+    e.define("urlize", 1, 1, b_urlize)
+    e.define("slugify", 1, 1, b_slugify)
+    e.define("urlEncode", 1, 1, b_url_encode)
+    e.define("urlDecode", 1, 1, b_url_decode)
+    e.define("jsonStr", 1, 1, b_json_str)
+    e.define("jsonify", 1, 1, b_jsonify)
+    e.define("toString", 1, 1, b_to_string)
+    e.define("printf", 1, many, b_printf)
+    e.define("findRE", 2, 3, b_find_re)
+    e.define("replaceRE", 3, 3, b_replace_re)
+
+    // lists, maps, and both
+    e.define("length", 1, 1, b_length)
+    e.define("isEmpty", 1, 1, b_is_empty)
+    e.define("nonEmpty", 1, 1, b_non_empty)
+    e.define("head", 1, 1, b_head)
+    e.define("last", 1, 1, b_last)
+    e.define("tail", 1, 1, b_tail)
+    e.define("append", 2, 2, b_append)
+    e.define("prepend", 2, 2, b_prepend)
+    e.define("reverse", 1, 1, b_reverse)
+    e.define("distinct", 1, 1, b_distinct)
+    e.define("compact", 1, 1, b_compact)
+    e.define("flatten", 1, 1, b_flatten)
+    e.define("take", 2, 2, b_take)
+    e.define("takeRight", 2, 2, b_take_right)
+    e.define("drop", 2, 2, b_drop)
+    e.define("dropRight", 2, 2, b_drop_right)
+    e.define("slice", 2, 3, b_slice)
+    e.define("join", 2, 3, b_join)
+    e.define("contains", 2, 2, b_contains)
+    e.define("toSeq", 1, 1, b_to_seq)
+    e.define("keys", 1, 1, b_keys)
+    e.define("values", 1, 1, b_values)
+    e.define("sort", 1, 1, b_sort)
+    e.define("sortBy", 2, 2, b_sort_by)
+    e.define("intersect", 2, 2, b_intersect)
+    e.define("union", 2, 2, b_union)
+    e.define("symdiff", 2, 2, b_symdiff)
+    e.define("complement", 2, many, b_complement)
+    e.define("filter", 2, 2, b_filter)
+    e.define("filterNot", 2, 2, b_filter_not)
+    e.define("map", 2, 2, b_map)
+    e.define("querify", 1, 1, b_querify)
+    e.define("default", 2, 2, b_default)
+
+    // dates, and the rest
+    e.define("format", 2, 2, b_format)
+    e.define("unix", 1, 1, b_unix)
+    e.define("partial", 1, 2, b_partial)
+end add_builtins
+
+// -- arguments -------------------------------------------------------------------------------------
+
+private ordinal(i: usize) -> string = i match
+    0 -> "first"
+    1 -> "second"
+    2 -> "third"
+    _ -> s"argument ${i + 1}"
+
+private want_str(a: Buf[Value], i: usize) -> Result[string, Fail] = a[i] match
+    Str(s) -> Ok(s)
+    v -> Err(Message(s"the ${ordinal(i)} argument should be a string, and is ${v.kind()}"))
+
+private want_num(a: Buf[Value], i: usize) -> Result[Value, Fail] = a[i] match
+    Int(n) -> Ok(Int(n))
+    Real(x) -> Ok(Real(x))
+    v -> Err(Message(s"the ${ordinal(i)} argument should be a number, and is ${v.kind()}"))
+
+// A whole number: an `Int`, or a `Real` with nothing after the point.
+private want_int(a: Buf[Value], i: usize) -> Result[long, Fail] = a[i] match
+    Int(n) -> Ok(n)
+    Real(x) ->
+        if x == x.trunc() && x.abs() < 9.2e18 then Ok(long(x))
+        else Err(Message(s"the ${ordinal(i)} argument should be a whole number, and is $x"))
+    v -> Err(Message(s"the ${ordinal(i)} argument should be a whole number, and is ${v.kind()}"))
+
+private want_list(a: Buf[Value], i: usize) -> Result[Buf[Value], Fail] = a[i] match
+    List(xs) -> Ok(xs)
+    v -> Err(Message(s"the ${ordinal(i)} argument should be a list, and is ${v.kind()}"))
+
+private wrong(name: string, v: Value) -> Result[Value, Fail] = fail(s"$name does not apply to ${v.kind()}")
+
+private chars_of(s: string) -> Buf[char]
+    val cs: Buf[char] = buf()
+
+    for c in s.chars do cs.push(c)
+    cs
+
+private from_chars(cs: Buf[char], from: usize, to: usize) -> string
+    var b = str_builder()
+
+    for i in from..<to do b.push_char(cs[i])
+    b.finish()
+
+private sub_list(xs: Buf[Value], from: usize, to: usize) -> Value
+    val out: Buf[Value] = buf()
+
+    for i in from..<to do out.push(xs[i])
+    List(out)
+
+// A count clamped into 0..=len, from a whole number that may be negative or too large.
+private clamp(n: long, len: usize) -> usize = if n < 0 then 0 elif n > long(len) then len else usize(n)
+
+// -- numbers ---------------------------------------------------------------------------------------
+
+private b_abs(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = want_num(a, 0)? match
+    Int(n) -> Ok(if n < 0 then arith(Sub, Int(0), Int(n)).unwrap_or(Null) else Int(n))
+    Real(x) -> Ok(Real(x.abs()))
+    v -> Ok(v)
+
+private b_ceil(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = want_num(a, 0)? match
+    Real(x) -> Ok(whole(x.ceil()))
+    v -> Ok(v)
+
+private b_floor(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = want_num(a, 0)? match
+    Real(x) -> Ok(whole(x.floor()))
+    v -> Ok(v)
+
+// Half away from zero, which is what a person rounding by hand does: `round 2.5` is `3`.
+private b_round(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = want_num(a, 0)? match
+    Real(x) -> Ok(whole(x.round()))
+    v -> Ok(v)
+
+// `max 3 7`, or `max [3, 7]`: the greatest of the arguments, or of one list's elements.
+private b_max(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = extreme(a, 1)
+private b_min(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = extreme(a, -1)
+
+private extreme(a: Buf[Value], sign: int) -> Result[Value, Fail]
+    val xs = if a.len() == 1 then want_list(a, 0)? else a
+
+    if xs.len() == 0 then return fail("there is nothing to choose from in an empty list")
+
+    var best = xs[0]
+
+    for i in 1..<xs.len()
+        ordering(xs[i], best) match
+            Ok(o) -> if o * sign > 0 then best = xs[i]
+            Err(m) -> return fail(m)
+
+    Ok(best)
+
+private b_sum(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    var total = Int(0)
+
+    for x in want_list(a, 0)?
+        total = arith(Add, total, x) match
+            Ok(v) -> v
+            Err(m) -> return fail(m)
+
+    Ok(total)
+
+// `int`: a number truncated toward zero, or a string read as one.
+private b_int(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Int(n) -> Ok(Int(n))
+    Real(x) -> Ok(whole(x.trunc()))
+    Str(s) -> parse_long(s.trim()) match
+        Ok(n) -> Ok(Int(n))
+        Err(_) -> parse_real(s.trim()) match
+            Ok(x) -> Ok(whole(x.trunc()))
+            Err(_) -> fail(s"`$s` is not a number")
+    Bool(b) -> Ok(Int(if b then 1 else 0))
+    v -> wrong("int", v)
+
+// `float` and `number`: a number as it is, or a string read as one -- an integer if it is written
+// as one, so `number '42'` prints `42`.
+private b_float(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Int(n) -> Ok(Int(n))
+    Real(x) -> Ok(Real(x))
+    Str(s) -> parse_long(s.trim()) match
+        Ok(n) -> Ok(Int(n))
+        Err(_) -> parse_real(s.trim()) match
+            Ok(x) -> Ok(Real(x))
+            Err(_) -> fail(s"`$s` is not a number")
+    v -> wrong("float", v)
+
+private b_bool(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Bool(a[0].truthy()))
+
+// `range 3` is `[0, 1, 2]`; `range 1 4` is `[1, 2, 3]`.
+private b_range(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val lo = if a.len() == 2 then want_int(a, 0)? else 0
+    val hi = want_int(a, a.len() - 1)?
+
+    if hi - lo > 1000000 then return fail("a range is limited to a million elements")
+
+    val out: Buf[Value] = buf()
+    var i = lo
+
+    while i < hi
+        out.push(Int(i))
+        i += 1
+
+    Ok(List(out))
+
+// -- text ------------------------------------------------------------------------------------------
+
+private b_capitalize(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val s = want_str(a, 0)?
+    val cs = chars_of(s)
+
+    if cs.len() == 0 then return Ok(Str(s))
+
+    Ok(Str(to_upper(str(cs[0])) + to_lower(from_chars(cs, 1, cs.len()))))
+
+private b_lower(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(to_lower(want_str(a, 0)?)))
+private b_upper(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(to_upper(want_str(a, 0)?)))
+private b_trim(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(want_str(a, 0)?.trim()))
+private b_ltrim(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(want_str(a, 0)?.trim_start()))
+private b_rtrim(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(want_str(a, 0)?.trim_end()))
+
+private b_html_escape(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(html_escape(want_str(a, 0)?)))
+
+/** Text made safe to put between tags or in a quoted attribute: `& < > ' "` become entities. */
+html_escape(s: string) -> string
+    var b = str_builder()
+
+    for ch in s.chars
+        ch match
+            '&' -> b.push("&amp;")
+            '<' -> b.push("&lt;")
+            '>' -> b.push("&gt;")
+            '\'' -> b.push("&apos;")
+            '"' -> b.push("&quot;")
+            _ -> b.push_char(ch)
+
+    b.finish()
+
+private b_newline_to_br(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Str(replace_text(want_str(a, 0)?, "\n", "<br />\n", false)))
+
+private b_remove(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Str(replace_text(want_str(a, 1)?, want_str(a, 0)?, "", false)))
+
+private b_remove_first(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Str(replace_text(want_str(a, 1)?, want_str(a, 0)?, "", true)))
+
+private b_replace(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Str(replace_text(want_str(a, 2)?, want_str(a, 0)?, want_str(a, 1)?, false)))
+
+// Every occurrence of `old` replaced, or only the first. An empty `old` replaces nothing.
+private replace_text(s: string, old: string, new: string, first_only: bool) -> string
+    if old.len == 0 then return s
+
+    var b = str_builder()
+    var at: usize = 0
+
+    loop
+        s.index_of_from(old, at) match
+            Some(i) ->
+                b.push(s[at..<i])
+                b.push(new)
+                at = i + old.len
+
+                if first_only then break
+            None -> break
+
+    b.push(s[at..<s.len])
+    b.finish()
+end replace_text
+
+private b_starts_with(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Bool(want_str(a, 1)?.starts_with(want_str(a, 0)?)))
+
+private b_ends_with(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    Ok(Bool(want_str(a, 1)?.ends_with(want_str(a, 0)?)))
+
+private b_split(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val sep = want_str(a, 0)?
+    val s = want_str(a, 1)?
+
+    if sep.len == 0 then
+        val out: Buf[Value] = buf()
+
+        for ch in s.chars do out.push(Str(str(ch)))
+
+        return Ok(List(out))
+
+    Ok(strings_of(sysl.text.split(s, sep)))
+
+// `substring from to s`, counted in characters.
+private b_substring(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val cs = chars_of(want_str(a, 2)?)
+    val from = clamp(want_int(a, 0)?, cs.len())
+    val to = clamp(want_int(a, 1)?, cs.len())
+
+    Ok(Str(if from < to then from_chars(cs, from, to) else ""))
+
+// `truncate n s`: the first `n` words of `s`, and `...` (or the third argument) if any were cut.
+private b_truncate(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val n = want_int(a, 0)?
+    val s = want_str(a, 1)?
+    val ellipsis = if a.len() == 3 then want_str(a, 2)? else "..."
+    var words: long = 0
+    var i: usize = 0
+    val b = s.bytes
+
+    // A word is a run of non-space; the text is cut where the `n`th run of space begins.
+    while i < b.len
+        if b[i].is_space() then
+            i += 1
+        else
+            words += 1
+
+            while i < b.len && !b[i].is_space() do i += 1
+
+            if words == n && i < b.len then
+                var j = i
+
+                while j < b.len && b[j].is_space() do j += 1
+
+                if j < b.len then return Ok(Str(s[0..<i] + ellipsis))
+
+    Ok(Str(s))
+end b_truncate
+
+private b_urlize(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(urlize(want_str(a, 0)?)))
+private b_slugify(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(slugify(want_str(a, 0)?)))
+
+private b_url_encode(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(url_encode(want_str(a, 0)?)))
+
+/** Text encoded for a URL's query: a space is `+`, letters, digits and `-_.~` are themselves, and
+ * every other byte is `%XX`.
+ */
+url_encode(s: string) -> string
+    var b = str_builder()
+    val hex = "0123456789ABCDEF"
+
+    for x in s.bytes
+        if x.is_alnum() || x == u8('-') || x == u8('_') || x == u8('.') || x == u8('~') then
+            b.push_char(char(u32(x)))
+        elif x == u8(' ') then
+            b.push("+")
+        else
+            b.push("%")
+            b.push_char(char(u32(hex.bytes[usize(x >> 4)])))
+            b.push_char(char(u32(hex.bytes[usize(x & 15)])))
+
+    b.finish()
+
+private b_url_decode(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val s = want_str(a, 0)?
+    val out: Buf[u8] = buf()
+    var i: usize = 0
+    val b = s.bytes
+
+    while i < b.len
+        if b[i] == u8('%') then
+            if i + 2 >= b.len then return fail(s"`%` at $i is not followed by two hex digits")
+
+            val hi = hex_value(b[i + 1])
+            val lo = hex_value(b[i + 2])
+
+            if hi < 0 || lo < 0 then return fail(s"`%` at $i is not followed by two hex digits")
+
+            out.push(u8(hi * 16 + lo))
+            i += 3
+        elif b[i] == u8('+') then
+            out.push(u8(' '))
+            i += 1
+        else
+            out.push(b[i])
+            i += 1
+
+    sysl.text.from_utf8(out.view()) match
+        Ok(t) -> Ok(Str(t))
+        Err(_) -> fail("the decoded bytes are not UTF-8 text")
+end b_url_decode
+
+private hex_value(x: u8) -> int =
+    if x.is_digit() then int(x) - 48
+    elif x >= u8('a') && x <= u8('f') then int(x) - 87
+    elif x >= u8('A') && x <= u8('F') then int(x) - 55
+    else -1
+
+private b_json_str(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    var b = str_builder()
+
+    json_escape(&b, text_of(a[0]))
+    Ok(Str(b.finish()))
+
+/** The inside of a JSON string, without its quotes: what RFC 8259 requires escaped, and U+2028 and
+ * U+2029, which JSON allows and a `<script>` does not.
+ */
+json_escape(b: *sysl.text.StrBuilder, s: string)
+    val hex = "0123456789abcdef"
+
+    for ch in s.chars
+        val code = u32(ch)
+
+        ch match
+            '"' -> b.push("\\\"")
+            '\\' -> b.push("\\\\")
+            '\n' -> b.push("\\n")
+            '\r' -> b.push("\\r")
+            '\t' -> b.push("\\t")
+            _ ->
+                if code == 8 then b.push("\\b")
+                elif code == 12 then b.push("\\f")
+                elif code < 32 || code == 0x2028 || code == 0x2029 then
+                    b.push("\\u")
+
+                    for shift in [12u32, 8u32, 4u32, 0u32]
+                        b.push_char(char(u32(hex.bytes[usize((code >> shift) & 15)])))
+                else
+                    b.push_char(ch)
+end json_escape
+
+private b_jsonify(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    var b = str_builder()
+
+    write_json(&b, a[0])
+    Ok(Str(b.finish()))
+
+/** A value as JSON text: `null`, a lambda included, is `null`; a map is an object in its own order. */
+write_json(b: *sysl.text.StrBuilder, v: Value)
+    v match
+        Null -> b.push("null")
+        Lambda(_) -> b.push("null")
+        Bool(x) -> b.push(if x then "true" else "false")
+        Int(n) -> b.push(str(n))
+        Real(x) -> b.push(if x.is_finite() then str(x) else "null")
+        Str(s) ->
+            b.push("\"")
+            json_escape(b, s)
+            b.push("\"")
+        List(xs) ->
+            b.push("[")
+
+            for i in 0..<xs.len()
+                if i > 0 then b.push(",")
+
+                write_json(b, xs[i])
+
+            b.push("]")
+        Obj(es) ->
+            b.push("{")
+
+            for i in 0..<es.len()
+                if i > 0 then b.push(",")
+
+                b.push("\"")
+                json_escape(b, es[i].key)
+                b.push("\":")
+                write_json(b, es[i].value)
+
+            b.push("}")
+end write_json
+
+private b_to_string(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(text_of(a[0])))
+
+private b_printf(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val args: Buf[Value] = buf()
+
+    for i in 1..<a.len() do args.push(a[i])
+
+    printf(want_str(a, 0)?, args) match
+        Ok(s) -> Ok(Str(s))
+        Err(m) -> fail(m)
+
+// `findRE pattern s [limit]`: every match, each as `[whole, group1, group2, …]`. A group that took
+// no part in the match is the empty string. The pattern is POSIX extended syntax.
+private b_find_re(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val pattern = want_str(a, 0)?
+    val s = want_str(a, 1)?
+    val limit = if a.len() == 3 then want_int(a, 2)? else 9223372036854775807
+    val re = regex(pattern) match
+        Ok(r) -> r
+        Err(e) -> return fail(s"the pattern `$pattern` is malformed: ${describe(e)}")
+
+    val out: Buf[Value] = buf()
+    val all = re.find_all(s)
+
+    for i in 0..<all.len()
+        if long(i) >= limit then break
+
+        val m = all.at(i)
+        val groups: Buf[Value] = buf()
+
+        groups.push(Str(m.text()))
+
+        for g in 1..<m.group_count() do groups.push(Str(m.group(g).unwrap_or("")))
+
+        out.push(List(groups))
+
+    Ok(List(out))
+end b_find_re
+
+// `replaceRE pattern replacement s`: `\1` … `\9` in the replacement name the groups.
+private b_replace_re(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val pattern = want_str(a, 0)?
+    val re = regex(pattern) match
+        Ok(r) -> r
+        Err(e) -> return fail(s"the pattern `$pattern` is malformed: ${describe(e)}")
+
+    Ok(Str(re.replace_all(want_str(a, 2)?, want_str(a, 1)?)))
+
+// -- lists, maps, and both -------------------------------------------------------------------------
+
+private b_length(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Str(_) -> Ok(Int(long(a[0].len())))
+    List(_) -> Ok(Int(long(a[0].len())))
+    Obj(_) -> Ok(Int(long(a[0].len())))
+    Null -> Ok(Int(0))
+    v -> wrong("length", v)
+
+private b_is_empty(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Bool(b_length(c, a)? == Int(0)))
+private b_non_empty(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Bool(b_length(c, a)? != Int(0)))
+
+private b_head(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 0)?
+
+    if xs.len() == 0 then return fail("the list is empty")
+
+    Ok(xs[0])
+
+private b_last(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 0)?
+
+    if xs.len() == 0 then return fail("the list is empty")
+
+    Ok(xs[xs.len() - 1])
+
+private b_tail(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 0)?
+
+    if xs.len() == 0 then return fail("the list is empty")
+
+    Ok(sub_list(xs, 1, xs.len()))
+
+private b_append(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val out = want_list(a, 1)?.copy()
+
+    out.push(a[0])
+    Ok(List(out))
+
+private b_prepend(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 1)?
+    val out: Buf[Value] = buf()
+
+    out.push(a[0])
+
+    for x in xs do out.push(x)
+
+    Ok(List(out))
+
+private b_reverse(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    List(xs) ->
+        val out: Buf[Value] = buf()
+        var i = xs.len()
+
+        while i > 0
+            i -= 1
+            out.push(xs[i])
+
+        Ok(List(out))
+    Str(s) ->
+        val cs = chars_of(s)
+        var b = str_builder()
+        var i = cs.len()
+
+        while i > 0
+            i -= 1
+            b.push_char(cs[i])
+
+        Ok(Str(b.finish()))
+    v -> wrong("reverse", v)
+
+private has_value(xs: Buf[Value], v: Value) -> bool
+    for x in xs
+        if x == v then return true
+
+    false
+
+private distinct_of(xs: Buf[Value]) -> Buf[Value]
+    val out: Buf[Value] = buf()
+
+    for x in xs
+        if !has_value(out, x) then out.push(x)
+
+    out
+
+private b_distinct(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(List(distinct_of(want_list(a, 0)?)))
+
+private b_compact(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val out: Buf[Value] = buf()
+
+    for x in want_list(a, 0)?
+        x match
+            Null -> ()
+            _ -> out.push(x)
+
+    Ok(List(out))
+
+// One level of nesting removed: `[[1, 2], 3]` is `[1, 2, 3]`.
+private b_flatten(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val out: Buf[Value] = buf()
+
+    for x in want_list(a, 0)?
+        x match
+            List(ys) -> for y in ys do out.push(y)
+            _ -> out.push(x)
+
+    Ok(List(out))
+
+// `take`, `drop` and their right-hand twins, over a list or a string's characters.
+private cut(a: Buf[Value], name: string, keep_front: bool, from_right: bool) -> Result[Value, Fail]
+    val n = want_int(a, 0)?
+
+    a[1] match
+        List(xs) ->
+            val (lo, hi) = bounds(n, xs.len(), keep_front, from_right)
+
+            Ok(sub_list(xs, lo, hi))
+        Str(s) ->
+            val cs = chars_of(s)
+            val (lo, hi) = bounds(n, cs.len(), keep_front, from_right)
+
+            Ok(Str(from_chars(cs, lo, hi)))
+        v -> wrong(name, v)
+
+// `take` keeps the front `n`, `takeRight` the back `n`; `drop` and `dropRight` keep the rest.
+private bounds(n: long, len: usize, take: bool, from_right: bool) -> (usize, usize)
+    val k = clamp(n, len)
+
+    if take then
+        if from_right then (len - k, len) else (0, k)
+    else
+        if from_right then (0, len - k) else (k, len)
+
+private b_take(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = cut(a, "take", true, false)
+private b_take_right(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = cut(a, "takeRight", true, true)
+private b_drop(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = cut(a, "drop", false, false)
+private b_drop_right(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = cut(a, "dropRight", false, true)
+
+// `slice from x` or `slice from until x`, over a list or a string's characters.
+private b_slice(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val subject = a[a.len() - 1]
+    val from = want_int(a, 0)?
+
+    subject match
+        List(xs) ->
+            val until = if a.len() == 3 then want_int(a, 1)? else long(xs.len())
+            val lo = clamp(from, xs.len())
+            val hi = clamp(until, xs.len())
+
+            Ok(if lo < hi then sub_list(xs, lo, hi) else new_list())
+        Str(s) ->
+            val cs = chars_of(s)
+            val until = if a.len() == 3 then want_int(a, 1)? else long(cs.len())
+            val lo = clamp(from, cs.len())
+            val hi = clamp(until, cs.len())
+
+            Ok(Str(if lo < hi then from_chars(cs, lo, hi) else ""))
+        v -> wrong("slice", v)
+
+// `join sep xs`, or `join sep last xs` with a different separator before the last element:
+// `join ', ' ' and ' xs` is `a, b and c`.
+private b_join(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val sep = want_str(a, 0)?
+    val last_sep = if a.len() == 3 then want_str(a, 1)? else sep
+    val xs = want_list(a, a.len() - 1)?
+    var b = str_builder()
+
+    for i in 0..<xs.len()
+        if i > 0 then b.push(if i == xs.len() - 1 then last_sep else sep)
+
+        write_value(&b, xs[i])
+
+    Ok(Str(b.finish()))
+
+// `contains x coll`: an element of a list, a key of a map, or a substring of a string.
+private b_contains(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[1] match
+    List(xs) -> Ok(Bool(has_value(xs, a[0])))
+    Obj(_) -> Ok(Bool(a[1].get(want_str(a, 0)?).is_some()))
+    Str(s) -> Ok(Bool(s.contains(want_str(a, 0)?)))
+    Null -> Ok(Bool(false))
+    v -> wrong("contains", v)
+
+// A list as itself, a map as its values, a string as its characters.
+private b_to_seq(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    List(_) -> Ok(a[0])
+    Obj(_) -> b_values(c, a)
+    Str(s) ->
+        val out: Buf[Value] = buf()
+
+        for ch in s.chars do out.push(Str(str(ch)))
+
+        Ok(List(out))
+    Null -> Ok(new_list())
+    v -> wrong("toSeq", v)
+
+private b_keys(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Obj(es) ->
+        val out: Buf[Value] = buf()
+
+        for e in es do out.push(Str(e.key))
+
+        Ok(List(out))
+    v -> wrong("keys", v)
+
+private b_values(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Obj(es) ->
+        val out: Buf[Value] = buf()
+
+        for e in es do out.push(e.value)
+
+        Ok(List(out))
+    v -> wrong("values", v)
+
+// `sort xs`: numbers by value, strings by their bytes; a stable insertion sort, since a template's
+// lists are a page's worth.
+private b_sort(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 0)?
+    val keys = xs.copy()
+
+    sorted(xs, keys)
+
+// `sortBy `.date` xs`: sorted by what the lambda answers for each element.
+private b_sort_by(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = want_list(a, 1)?
+    val keys: Buf[Value] = buf()
+
+    for x in xs do keys.push(c.apply(a[0], x)?)
+
+    sorted(xs, keys)
+
+private sorted(xs: Buf[Value], keys: Buf[Value]) -> Result[Value, Fail]
+    val order: Buf[usize] = buf()
+
+    for i in 0..<xs.len()
+        var j = order.len()
+
+        while j > 0
+            val o = ordering(keys[order[j - 1]], keys[i]) match
+                Ok(o) -> o
+                Err(m) -> return fail(m)
+
+            if o <= 0 then break
+
+            j -= 1
+
+        order.insert(j, i)
+
+    val out: Buf[Value] = buf()
+
+    for i in order do out.push(xs[i])
+
+    Ok(List(out))
+end sorted
+
+private b_intersect(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val ys = want_list(a, 1)?
+    val out: Buf[Value] = buf()
+
+    for x in distinct_of(want_list(a, 0)?)
+        if has_value(ys, x) then out.push(x)
+
+    Ok(List(out))
+
+private b_union(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val out = distinct_of(want_list(a, 0)?)
+
+    for y in want_list(a, 1)?
+        if !has_value(out, y) then out.push(y)
+
+    Ok(List(out))
+
+private b_symdiff(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val xs = distinct_of(want_list(a, 0)?)
+    val ys = distinct_of(want_list(a, 1)?)
+    val out: Buf[Value] = buf()
+
+    for x in xs
+        if !has_value(ys, x) then out.push(x)
+
+    for y in ys
+        if !has_value(xs, y) then out.push(y)
+
+    Ok(List(out))
+
+// `complement a b … xs`: the elements of the last list found in none of the others.
+private b_complement(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val last = want_list(a, a.len() - 1)?
+    val out: Buf[Value] = buf()
+
+    for x in distinct_of(last)
+        var seen = false
+
+        for i in 0..<a.len() - 1
+            if has_value(want_list(a, i)?, x) then
+                seen = true
+                break
+
+        if !seen then out.push(x)
+
+    Ok(List(out))
+end b_complement
+
+// The elements of a list -- or the values of a map -- for which a lambda is true, or false.
+private keep(c: *Ctx, a: Buf[Value], name: string, want: bool) -> Result[Value, Fail]
+    val xs = elements(a[1], name)?
+    val out: Buf[Value] = buf()
+
+    for x in xs
+        if c.apply(a[0], x)?.truthy() == want then out.push(x)
+
+    Ok(List(out))
+
+private elements(v: Value, name: string) -> Result[Buf[Value], Fail] = v match
+    List(xs) -> Ok(xs)
+    Obj(es) ->
+        val out: Buf[Value] = buf()
+
+        for e in es do out.push(e.value)
+
+        Ok(out)
+    Null -> Ok(buf())
+    _ -> Err(Message(s"$name does not apply to ${v.kind()}"))
+
+private b_filter(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = keep(c, a, "filter", true)
+private b_filter_not(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = keep(c, a, "filterNot", false)
+
+private b_map(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val out: Buf[Value] = buf()
+
+    for x in elements(a[1], "map")? do out.push(c.apply(a[0], x)?)
+
+    Ok(List(out))
+
+// A map as a URL query, `a=1&b=x+y`, with keys and values encoded.
+private b_querify(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
+    Obj(es) ->
+        var b = str_builder()
+
+        for i in 0..<es.len()
+            if i > 0 then b.push("&")
+
+            b.push(url_encode(es[i].key))
+            b.push("=")
+            b.push(url_encode(text_of(es[i].value)))
+
+        Ok(Str(b.finish()))
+    v -> wrong("querify", v)
+
+// `default d x`: `x`, unless it is `null`, empty, or zero. `false` is a value someone chose, and
+// stays.
+private b_default(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[1] match
+    Bool(_) -> Ok(a[1])
+    v -> Ok(if v.truthy() then v else a[0])
+
+// -- dates, and the rest ---------------------------------------------------------------------------
+
+private b_format(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val pattern = want_str(a, 0)?
+    val when = want_str(a, 1)?
+
+    format_date(pattern, when) match
+        Ok(s) -> Ok(Str(s))
+        Err(m) -> fail(m)
+
+private b_unix(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
+    val when = want_str(a, 0)?
+
+    unix_millis(when) match
+        Ok(n) -> Ok(Int(n))
+        Err(m) -> fail(m)
+
+private b_partial(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] =
+    c.partial(want_str(a, 0)?, if a.len() == 2 then a[1] else Null)

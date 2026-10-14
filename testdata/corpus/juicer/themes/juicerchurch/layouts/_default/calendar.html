@@ -1,0 +1,35 @@
+<!-- Calendar layout — month-grid view of every event for the next 12
+     months. Walks `.site.calendar` (engine pre-computed) and renders one
+     month-grid per entry via the `month-grid` partial. Recurring weekly
+     events are already expanded by the engine, so the template just
+     iterates cells. The first month is the current one; the surface ends
+     12 months out (configurable via `calendarMonths` in `site.toml`).
+
+     The page intro (anything in the `_index.md` body) renders above the
+     month tower. Picked via `layout: calendar` in `_index.md`. -->
+{{ define content }}
+  <article class="juicerchurch-page-wrap juicerchurch-calendar-wrap">
+    <h1 class="juicerchurch-page-title">{{ .page.title }}</h1>
+    {{ if .content }}
+    <div class="juicerchurch-content juicerchurch-calendar-intro">
+      {{ .content }}
+    </div>
+    {{ end }}
+
+    {{ if .site.calendar }}
+    <nav class="juicerchurch-calendar-jump" aria-label="Jump to month">
+      {{ for m <- .site.calendar }}
+      <a href="#cal-{{ m.year }}-{{ m.month }}">{{ m.monthName }}</a>
+      {{ end }}
+    </nav>
+
+    <div class="juicerchurch-calendar-tower">
+      {{ for m <- .site.calendar }}
+      {{ partial 'month-grid' m }}
+      {{ end }}
+    </div>
+    {{ else }}
+    <p class="juicerchurch-empty">No upcoming events on the calendar.</p>
+    {{ end }}
+  </article>
+{{ end }}

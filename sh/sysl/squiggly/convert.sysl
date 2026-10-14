@@ -1,0 +1,73 @@
+module sh.sysl.squiggly
+
+import sh.sysl.json.Json
+import sh.sysl.toml
+import sysl.buf.{Buf, buf}
+import sysl.text.parse_real
+import sysl.time.{LocalDate, LocalTime, date_text, hour_of, minute_of, offset_text, second_of, us_of}
+
+// The two conversions a site generator makes before it renders anything: front matter and
+// configuration from TOML, data files from JSON.
+//
+// **Both keep the order the document was written in**, which a map here keeps too, so a table of
+// links renders in the order the author listed them.
+
+/** A TOML value as a template value.
+ *
+ * A table is a map and an array a list; integers, floats, strings and booleans are themselves.
+ * **The four date and time forms become text in ISO 8601**, `2024-03-12`, `2024-03-12T09:30:00`,
+ * `2024-03-12T09:30:00-07:00`, `09:30:00` -- which is what `format` and `unix` read, what sorts
+ * correctly as text, and what prints sensibly where a template writes one out as it is.
+ */
+from_toml(v: toml.Value) -> Value
+    v match
+        toml.Str(s) -> Str(s)
+        toml.Int(n) -> Int(n)
+        toml.Float(x) -> Real(x)
+        toml.Bool(b) -> Bool(b)
+        toml.OffsetDateTime(dt, o) -> Str(s"${date_text(dt.date)}T${iso_time(dt.time)}${offset_text(o)}")
+        toml.DateTime(dt) -> Str(s"${date_text(dt.date)}T${iso_time(dt.time)}")
+        toml.Date(d) -> Str(date_text(d))
+        toml.Time(t) -> Str(iso_time(t))
+        toml.Arr(items) ->
+            val out: Buf[Value] = buf()
+
+            for x in items do out.push(from_toml(x))
+
+            List(out)
+        toml.Table(entries) ->
+            val out: Buf[Entry] = buf()
+
+            for e in entries do out.push(Entry(e.key, from_toml(e.value)))
+
+            Obj(out)
+end from_toml
+
+/** A JSON value as a template value. An integer too large for 64 bits becomes a real. */
+from_json(v: Json) -> Value
+    v match
+        Json.Null -> Null
+        Json.Bool(b) -> Bool(b)
+        Json.Int(n) -> Int(n)
+        Json.Big(digits) -> Real(parse_real(digits).unwrap_or(0.0))
+        Json.Real(x) -> Real(x)
+        Json.Str(s) -> Str(s)
+        Json.Arr(items) ->
+            val out: Buf[Value] = buf()
+
+            for x in items do out.push(from_json(x))
+
+            List(out)
+        Json.Obj(members) ->
+            val out: Buf[Entry] = buf()
+
+            for m in members do out.push(Entry(m.key, from_json(m.value)))
+
+            Obj(out)
+end from_json
+
+// `09:30:00`, with the fraction only where there is one.
+private iso_time(t: LocalTime) -> string
+    val base = f"${hour_of(t)}%02d:${minute_of(t)}%02d:${second_of(t)}%02d"
+
+    if us_of(t) == 0 then base else f"${base}.${us_of(t)}%06d"

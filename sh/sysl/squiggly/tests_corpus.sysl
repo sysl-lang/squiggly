@@ -1,0 +1,48 @@
+module sh.sysl.squiggly
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_text, walk}
+import sysl.text.{Search, str_builder}
+
+// Every layout of every theme the user's sites are built with -- juicer's own themes and demos,
+// and the themes sysl's and texish's documentation ship -- migrated to this version's syntax and
+// held here as fixtures. Each must parse. Rendering them needs a site generator's data and is the
+// generator's test, not this one's.
+
+private corpus_dir() -> string
+    val here = __FILE__
+    val cut = here.last_index_of("/sh/sysl/squiggly/").expect("this file sits under sh/sysl/squiggly")
+
+    s"${here[0..<cut]}/testdata/corpus"
+
+private corpus() -> Buf[string]
+    val out: Buf[string] = buf()
+
+    for item in walk(corpus_dir())
+        val e = item.unwrap()
+
+        if !e.is_dir() && e.path.ends_with(".html") then out.push(e.path)
+
+    out
+
+@test("the corpus is all there")
+corpus_complete()
+    assert_eq(corpus().len(), 103usize)
+
+@test("every theme layout in the corpus parses")
+corpus_parses()
+    var failures = str_builder()
+    var count = 0
+
+    for path in corpus()
+        val text = read_text(path).unwrap()
+
+        parse(path, text) match
+            Ok(_) -> ()
+            Err(e) ->
+                count += 1
+                failures.push(e.render())
+                failures.push("\n")
+
+    if count > 0 then panic(s"$count of the corpus did not parse:\n${failures.finish()}")

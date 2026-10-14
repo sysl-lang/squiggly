@@ -1,0 +1,42 @@
+// A template engine for sysl: text with `{{ … }}` tags in it, rendered against a value.
+//
+// The language is squiggly's -- Go-template and Liquid in spirit, with `if`/`elsif`/`else`, `for`,
+// `with`, `match`/`case`, `define`/`block` layouts, partials, assignments, pipes and about eighty
+// builtin functions -- and it is the one juicer's themes are written in. A template is parsed once
+// into a `Template` and rendered as often as wanted against a `Value`: the null/bool/number/string/
+// list/map tree that TOML front matter, JSON data and a program's own records all convert into.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `squiggly`; the module a program imports is `sh.sysl.squiggly`.
+
+package {
+  name    = "squiggly"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with**, which is the one it was written and tested against.
+  sysl = "0.1.0-alpha.12"
+}
+
+// `parsing` is the cursor, the spans and the diagnostic that quotes the line; `toml` and `json` are
+// here for `from_toml` and `from_json`, the two conversions a site generator makes before it renders
+// anything. All three share the one `parsing`, so the closure is three small packages.
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
+  toml    { git = "github.com/sysl-lang/toml",    version = "0.1.3" }
+  json    { git = "github.com/sysl-lang/json",    version = "0.2.1" }
+}
+
+// **`heap = true`, because a value is a tree.** Lists and maps are `Buf`s, the output is gathered in
+// a builder, and a template's body is a tree of nodes whose size the text decides.
+//
+// **What is NOT here is `os` or `posix`.** The engine opens nothing and reads no clock: a template
+// arrives as text, a partial arrives through a loader the caller supplies, and `now` -- which would
+// need the clock -- is the caller's to register, so a build renders the same bytes every time.
+requires {
+  heap = true
+}

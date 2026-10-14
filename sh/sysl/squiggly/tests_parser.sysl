@@ -1,0 +1,282 @@
+module sh.sysl.squiggly
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The port of Scala squiggly's TagParserTests -- each tag's expression written out in prefix form
+// rather than compared as a tree -- and of IndexTests, MethodCallTests, PipeTests, and the parse
+// errors, each of which names a line and a column.
+
+// What a tag's expression parsed to.
+private p(tag: string) -> string
+    val t = parse("t", s"{{ $tag }}") match
+        Ok(t) -> t
+        Err(e) -> panic(s"expected a tag, got:\n${e.render()}")
+
+    t.body[0] match
+        Out(e) -> show_expr(e)
+        _ -> panic("not an expression tag")
+
+// The kind of tag a tag parsed to, with what it carries.
+private shape(text: string) -> string
+    val t = parse("t", text).unwrap()
+
+    t.body[0] match
+        Out(e) -> s"out ${show_expr(e)}"
+        Assign(_, n, e) -> s"assign $n ${show_expr(e)}"
+        Return(_, e) -> e match
+            Some(x) -> s"return ${show_expr(x)}"
+            None -> "return"
+        If(arms, els) -> s"if ${show_expr(arms[0].tests[0])} arms=${arms.len()} else=${els.is_some()}"
+        Match(_, e, arms, els) -> s"match ${show_expr(e)} cases=${arms.len()} else=${els.is_some()}"
+        For(_, a, b, e, _, els) -> s"for [$a] [$b] ${show_expr(e)} else=${els.is_some()}"
+        With(_, e, _, els) -> s"with ${show_expr(e)} else=${els.is_some()}"
+        Define(n) -> s"define $n"
+        Block(_, n, e, _) -> s"block $n ${show_expr(e)}"
+        Text(s) -> s"text $s"
+
+// Where a template that does not parse goes wrong, and what is said.
+private parse_error(text: string) -> string
+    parse("t.html", text) match
+        Ok(_) -> panic(s"expected a parse error: $text")
+        Err(e) -> s"${e.place()}: ${e.message()}"
+
+// -- literals, names, paths -------------------------------------------------------------------------
+
+@test("literals")
+literals()
+    assert_eq(p("5"), "5")
+    assert_eq(p("-5"), "(neg 5)")
+    assert_eq(p("3.14"), "3.14")
+    assert_eq(p("6.02e23"), "602000000000000000000000")
+    assert_eq(p("true"), "true")
+    assert_eq(p("false"), "false")
+    assert_eq(p("null"), "null")
+    assert_eq(p("'hello'"), "'hello'")
+    assert_eq(p("\"hello\""), "'hello'")
+    assert_eq(p("'a\\tb'"), "'a\tb'")
+
+@test("names, variables and paths")
+names_and_paths()
+    assert_eq(p("x"), "x")
+    assert_eq(p("$x"), "$x")
+    assert_eq(p("."), ".")
+    assert_eq(p(".a"), ".a")
+    assert_eq(p(".a.b.c"), ".a.b.c")
+    assert_eq(p("$.a.b"), "$.a.b")
+    assert_eq(p("$"), "$.")
+
+// -- operators --------------------------------------------------------------------------------------
+
+@test("arithmetic, its precedence and its associativity")
+arithmetic_shapes()
+    assert_eq(p("3 + 4"), "(+ 3 4)")
+    assert_eq(p("3 - 4"), "(- 3 4)")
+    assert_eq(p("3 + 4 - 1"), "(- (+ 3 4) 1)")
+    assert_eq(p("3 + 4 * 5"), "(+ 3 (* 4 5))")
+    assert_eq(p("(3 + 4) * 5"), "(* (+ 3 4) 5)")
+    assert_eq(p("-(3 + 4)"), "(neg (+ 3 4))")
+    assert_eq(p("2 ^ 3 ^ 2"), "(^ 2 (^ 3 2))")
+    assert_eq(p("7 mod 3"), "(mod 7 3)")
+    assert_eq(p("10 \\ 3"), "(\\ 10 3)")
+    assert_eq(p("'a' ++ 'b'"), "(++ 'a' 'b')")
+    assert_eq(p("x - 1"), "(- x 1)")
+    assert_eq(p("x-1"), "(- x 1)")
+    assert_eq(p("-2 ^ 2"), "(neg (^ 2 2))")
+
+@test("logic")
+logic_shapes()
+    assert_eq(p("not x"), "(not x)")
+    assert_eq(p("x and y"), "(and x y)")
+    assert_eq(p("x or y"), "(or x y)")
+    assert_eq(p("a or b and c"), "(or a (and b c))")
+    assert_eq(p("not not x"), "(not (not x))")
+
+@test("comparisons, chained")
+comparison_shapes()
+    assert_eq(p("a < b"), "(a < b)")
+    assert_eq(p("a < b <= c"), "(a < b <= c)")
+    assert_eq(p("a = b"), "(a = b)")
+    assert_eq(p("a != b"), "(a != b)")
+    assert_eq(p("a div b"), "(a div b)")
+
+@test("conditional expressions")
+conditional_shapes()
+    assert_eq(p("if x then 1"), "(if x 1)")
+    assert_eq(p("if x then 1 else 2"), "(if x 1 2)")
+
+@test("map and list literals")
+collection_shapes()
+    assert_eq(p("{}"), "{}")
+    assert_eq(p("{a: 1, b: 2}"), "{a: 1 b: 2}")
+    assert_eq(p("[]"), "[]")
+    assert_eq(p("[1, 2, 3]"), "[1 2 3]")
+
+@test("index and field access")
+access_shapes()
+    assert_eq(p(".a[0]"), "(at .a 0)")
+    assert_eq(p("5.upper"), "5:upper")
+    assert_eq(p("xs[0]"), "(at xs 0)")
+    assert_eq(p("a.b.c"), "a:b:c")
+    assert_eq(p(".a[0].b"), "(at .a 0):b")
+
+@test("application: a name, then operands, and a space decides what is an argument")
+application_shapes()
+    assert_eq(p("upper 'hello'"), "(upper 'hello')")
+    assert_eq(p("substring 0 5 'helloworld'"), "(substring 0 5 'helloworld')")
+    assert_eq(p("f .a"), "(f .a)")
+    assert_eq(p("f.a"), "f:a")
+    assert_eq(p("f [1]"), "(f [1])")
+    assert_eq(p("f -1"), "(f -1)")
+    assert_eq(p("f x + 1"), "(+ (f x) 1)")
+    assert_eq(p("f (g x) y"), "(f (g x) y)")
+    assert_eq(p("partial 'card' ."), "(partial 'card' .)")
+    assert_eq(p("relURL (asset 'x.js')"), "(relURL (asset 'x.js'))")
+
+@test("pipes put the value last, and chain")
+pipe_shapes()
+    assert_eq(p("'hello' | upper"), "(upper 'hello')")
+    assert_eq(p(".l | take 2"), "(take 2 .l)")
+    assert_eq(p(". | filter `. > 4`"), "(filter `(. > 4)` .)")
+    assert_eq(p("x | f | g 1"), "(g 1 (f x))")
+    assert_eq(p("x + 1 | f = 2"), "((f (+ x 1)) = 2)")
+
+// -- tags -------------------------------------------------------------------------------------------
+
+@test("each kind of tag")
+tag_shapes()
+    assert_eq(shape("{{ if x }}{{ end }}"), "if x arms=1 else=false")
+    assert_eq(shape("{{ if x }}{{ elsif y }}{{ else }}{{ end }}"), "if x arms=2 else=true")
+    assert_eq(shape("{{ for .items }}{{ end }}"), "for [] [] .items else=false")
+    assert_eq(shape("{{ for x <- .items }}{{ end }}"), "for [x] [] .items else=false")
+    assert_eq(shape("{{ for x, i <- .items }}{{ else }}{{ end }}"), "for [x] [i] .items else=true")
+    assert_eq(shape("{{ with .a }}{{ end }}"), "with .a else=false")
+    assert_eq(shape("{{ match x }}{{ case 1 }}{{ case 2, 3 }}{{ end }}"), "match x cases=2 else=false")
+    assert_eq(shape("{{ v := 5 }}"), "assign v 5")
+    assert_eq(shape("{{ define foo }}{{ end }}"), "define foo")
+    assert_eq(shape("{{ block foo .x }}{{ end }}"), "block foo .x")
+    assert_eq(shape("{{ return }}"), "return")
+    assert_eq(shape("{{ return 5 }}"), "return 5")
+    assert_eq(shape("{{ if x then 1 else 2 }}"), "out (if x 1 2)")
+    assert_eq(parse("t", "{{ // some comment }}").unwrap().body.len(), 0)
+
+// -- index ------------------------------------------------------------------------------------------
+
+@test("indexing a list, a map and a string")
+indexing()
+    assert_eq(run_json("[3, 4, 5, 6]", "{{ .[3] }}"), "6")
+    assert_eq(run_json("{\"a\": 3, \"b\": 4}", "{{ .['a'] }}"), "3")
+    assert_eq(run_json("{\"a\": 3, \"b\": 4}", "[{{ .['x'] }}]"), "[]")
+    assert_eq(run_json("\"asdf\"", "{{ .[3] }}"), "f")
+    assert_eq(run_json("\"añb\"", "{{ .[1] }}"), "ñ")
+
+// Scala squiggly refused a negative index; here it counts from the end.
+@test("a negative index counts from the end")
+negative_index()
+    assert_eq(run_json("[3, 4, 5, 6]", "{{ .[-1] }} {{ .[-4] }}"), "6 3")
+    assert_eq(run_json("\"asdf\"", "{{ .[-1] }}"), "f")
+
+@test("indexing past either end, or something that has no elements, is an error")
+index_errors()
+    assert_eq(bad(json_value("[3, 4, 5, 6]"), "{{ .[4] }}"), "index 4 is out of range for length 4")
+    assert_eq(bad(json_value("[3, 4, 5, 6]"), "{{ .[-5] }}"), "index -5 is out of range for length 4")
+    assert_eq(bad(json_value("\"asdf\""), "{{ .[4] }}"), "index 4 is out of range for length 4")
+    assert_eq(bad(Int(5), "{{ .[0] }}"), "a number cannot be indexed")
+    assert_eq(bad(json_value("[1]"), "{{ .['a'] }}"), "an index is a whole number, and this is a string")
+    assert_eq(bad(json_value("{}"), "{{ .[0] }}"), "a map is indexed by a string, and this is a number")
+
+@test("a call to no function is an error, with a guess where one is close")
+unknown_function()
+    assert_eq(bad(Int(0), "{{ nosuchfunction 1 }}"), "there is no function `nosuchfunction`")
+    assert_eq(bad(Int(0), "{{ uper 'a' }}"), "there is no function `uper`")
+
+@test("a variable given arguments is told it is not a function")
+variable_called()
+    assert_eq(bad(Null, "{{ n := 3 }}{{ n -1 }}"), "`n` is a variable, not a function, so it cannot take arguments")
+
+@test("the wrong number of arguments is an error naming the count")
+arity_errors()
+    assert_eq(bad(Null, "{{ upper }}"), "`upper` is a function of 1 argument, and was given none")
+    assert_eq(bad(Null, "{{ upper 'a' 'b' }}"), "`upper` takes 1 argument, and was given 2")
+    assert_eq(bad(Null, "{{ take 1 }}"), "`take` takes 2 arguments, and was given 1")
+
+// -- fields that are functions ----------------------------------------------------------------------
+
+@test("a one-argument function reads as a field")
+methods()
+    assert_eq(run(Null, "{{ 'hello'.upper }}"), "HELLO")
+    assert_eq(run(Null, "{{ 'WORLD'.lower }}"), "world")
+    assert_eq(run(Null, "{{ 'hello'.length }}"), "5")
+    assert_eq(run(Null, "{{ 'hello'.reverse }}"), "olleh")
+    assert_eq(run(Null, "{{ 'hello'.reverse.upper }}"), "OLLEH")
+    assert_eq(run(Null, "{{ (-5).abs }}"), "5")
+    assert_eq(run(Null, "{{ [10, 20, 30].head }}"), "10")
+    assert_eq(run(Null, "{{ [10, 20, 30].last }}"), "30")
+    assert_eq(run(Null, "{{ [10, 20, 30].length }}"), "3")
+    assert_eq(run(Null, "{{ [1, 2, 3].reverse }}"), "[3, 2, 1]")
+    assert_eq(run(Null, "{{ [1, 2, 3].sum }}"), "6")
+    assert_eq(run(Null, "{{ [1, 2, 3].distinct }}"), "[1, 2, 3]")
+    assert_eq(run(Null, "{{ {a: 1, b: 2}.a }}"), "1")
+    assert_eq(run(Null, "{{ {a: 1, b: 2}.b }}"), "2")
+    assert_eq(run(Null, "[{{ {a: 1}.zzz }}]"), "[]")
+    assert_eq(run(Null, "{{ s := 'hello' }}{{ s.upper }}"), "HELLO")
+    assert_eq(run(Null, "{{ {a: [1, 2]}.a.length }}"), "2")
+
+@test("a field that is neither a key nor a function of one argument is an error")
+method_errors()
+    assert_eq(bad(Null, "{{ 5.upper }}"), "`upper`: the first argument should be a string, and is a number")
+    assert_eq(bad(Null, "{{ 5.nosuch }}"), "a number has no field `nosuch`")
+    assert_eq(bad(Null, "{{ 'x'.take }}"), "a string has no field `take`")
+
+// -- pipes ------------------------------------------------------------------------------------------
+
+@test("pipes, as Scala squiggly's suite has them, and a chain of them")
+pipes()
+    assert_eq(run(Null, "{{ [3, 4, 5] | take 2 }}"), "[3, 4]")
+    assert_eq(run(Null, "{{ 'asdf' | take 2 }}"), "as")
+    assert_eq(run_json("\"asdf\"", "{{ . | take 2 }}"), "as")
+    assert_eq(run(Null, "{{ [3, 1, 2] | sort | reverse | take 2 }}"), "[3, 2]")
+
+// -- parse errors -----------------------------------------------------------------------------------
+
+@test("a parse error names the line and column, and what was expected")
+parse_errors()
+    assert_eq(parse_error("a\nb {{ 1 + }}"), "t.html:2:10: expected an expression")
+    assert_eq(parse_error("{{ (1 + 2 }}"), "t.html:1:11: expected `)`")
+    assert_eq(parse_error("x\n\n  {{ if }}"), "t.html:3:9: expected an expression")
+    assert_eq(parse_error("{{ [1, 2 }}"), "t.html:1:10: expected `,` or `]`")
+    assert_eq(parse_error("{{ {a 1} }}"), "t.html:1:7: expected `:`")
+    assert_eq(parse_error("{{ 1 2 }}"), "t.html:1:6: expected the end of the tag")
+    assert_eq(parse_error("{{ x := }}"), "t.html:1:9: expected an expression")
+    assert_eq(parse_error("{{ define }}"), "t.html:1:11: expected the name of the block after `define`")
+    assert_eq(parse_error("{{ .a | 3 }}"), "t.html:1:9: expected the name of a function after `|`")
+    assert_eq(parse_error("{{ a. b }}"), "t.html:1:7: expected a field name written straight after the `.`")
+    assert_eq(parse_error("{{ }}"), "t.html:1:4: expected something inside the tag")
+    assert_eq(parse_error("{{ if x then }}"), "t.html:1:14: expected an expression")
+
+@test("a lexical mistake inside a tag is an error at it")
+lexical_errors()
+    assert_eq(parse_error("ok {{ 'abc }}"), "t.html:1:7: this string is malformed: unterminated")
+    assert_eq(parse_error("{{ 'a\\qb' }}"), "t.html:1:6: this string is malformed: not an escape")
+    assert_eq(parse_error("{{ a # b }}"), "t.html:1:6: `#` cannot appear in a tag")
+    assert_eq(parse_error("{{ 1 /* open }}"), "t.html:1:6: this comment is never closed")
+
+@test("an unclosed tag is an error at its opening delimiter")
+unclosed_tag()
+    assert_eq(parse_error("abc\n  {{ .x "), "t.html:2:3: this tag is never closed")
+    assert_eq(parse_error("{{// comment"), "t.html:1:1: this tag is never closed")
+
+@test("a rendered error quotes the line and points at the place")
+rendered_error()
+    val e = parse("t.html", "one\ntwo {{ 1 + }}").unwrap_err()
+    val text = e.render()
+    val lines = sysl.text.split(text, "\n")
+
+    assert_eq(lines[0], "error: expected an expression")
+    assert_eq(lines[1], " --> t.html:2:12")
+    assert_eq(lines[3], "2 | two {{ 1 + }}")
+
+@test("a lambda cannot hold another, since a backtick inside one closes it")
+nested_lambda()
+    assert_eq(parse_error("{{ map `(`.`)` . }}"), "t.html:1:10: a lambda cannot be written inside another")
+

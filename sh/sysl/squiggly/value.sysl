@@ -1,0 +1,257 @@
+module sh.sysl.squiggly
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, str_builder}
+
+// The value a template is rendered against, and every value an expression in one produces.
+//
+// **One enum of eight shapes**, because what reaches a template is data -- front matter, a site's
+// configuration, a list of pages -- and data is a tree of a few kinds of thing. A template asks a
+// value three questions: what is under this name, is it true, and how does it print. Each of the
+// three has one answer per shape, written here once.
+//
+// **The tree owns itself.** A list holds `Buf[Value]` and a map holds `Buf[Entry]`, so a value has a
+// finite size and a walk over one is an ordinary `match`. A `Buf` is shared on assignment, which
+// is what lets a host build a map by `put`ting into a value it already handed out.
+//
+// **A map keeps the order it was built in.** Entries are a sequence rather than a hash table, so
+// `for k, v <- .params` visits them in the order the front matter wrote them and a page renders the
+// same bytes on every build. `get` is a scan, which is the right trade for the sizes a template
+// sees: a page's front matter is a dozen keys, not ten thousand.
+
+/** One entry of a map: a key and what is under it. */
+struct Entry
+    key: string
+    value: Value
+
+/** A template value.
+ *
+ * **Two numbers, `Int` and `Real`, and they compare equal across the line.** TOML and JSON both say
+ * which a document wrote, and a loop counter, a page count and a year are integers that should print
+ * as integers. Arithmetic stays in `Int` while it can -- `7 / 2` is `3.5` and `6 / 2` is `3` -- and
+ * an integer that would overflow continues as a `Real` rather than wrapping.
+ *
+ * **One `Null`, where Scala squiggly had `null` and "undefined".** A missing key, a missing field of
+ * a missing map and the literal `null` are the same thing to a template: false, and printed as
+ * nothing. Two absences that print and test the same are one absence.
+ *
+ * **`Lambda` is an expression not yet evaluated**, written between backticks: `filter `.n > 2``
+ * hands `filter` the expression, and `filter` evaluates it once per element with `.` bound to that
+ * element. It is a value so that it can be an argument, and it prints as `<lambda>`.
+ */
+enum Value
+    Null
+    Bool(b: bool)
+    Int(n: long)
+    Real(x: real)
+    Str(s: string)
+    List(items: Buf[Value])
+    Obj(entries: Buf[Entry])
+    Lambda(body: &Expr)
+
+    /** The word an error message uses for this shape: `"a string"`, `"a list"`. */
+    kind(self) -> string = self match
+        Null -> "null"
+        Bool(_) -> "a boolean"
+        Int(_) -> "a number"
+        Real(_) -> "a number"
+        Str(_) -> "a string"
+        List(_) -> "a list"
+        Obj(_) -> "a map"
+        Lambda(_) -> "a lambda"
+
+    /** Whether `if` takes this branch.
+     *
+     * False are `null`, `false`, zero, the empty string, the empty list and the empty map;
+     * everything else is true. **An empty collection is false** because the question a template
+     * asks of one is almost always "is there anything to show", and `{{ if .tags }}` should not
+     * open a `<ul>` with nothing in it.
+     */
+    truthy(self) -> bool = self match
+        Null -> false
+        Bool(b) -> b
+        Int(n) -> n != 0
+        Real(x) -> x != 0.0
+        Str(s) -> s.len > 0
+        List(xs) -> xs.len() > 0
+        Obj(es) -> es.len() > 0
+        Lambda(_) -> true
+
+    /** What is under `key`, or `None` where this is not a map or has no such key. */
+    get(self, key: string) -> Option[Value] = self match
+        Obj(es) ->
+            var found: Option[Value] = None
+
+            for i in 0..<es.len()
+                if es.at(i).key == key then
+                    found = Some(es.at(i).value)
+                    break
+
+            found
+        _ -> None
+
+    /** The element at `i`, or `None` where this is not a list or is not that long. */
+    at(self, i: usize) -> Option[Value] = self match
+        List(xs) -> if i < xs.len() then Some(xs.at(i)) else None
+        _ -> None
+
+    /** How many elements a list has, entries a map has, or characters a string has; `0` for the
+     * rest.
+     */
+    len(self) -> usize = self match
+        List(xs) -> xs.len()
+        Obj(es) -> es.len()
+        Str(s) -> char_count(s)
+        _ -> 0
+
+    /** Set `key` in a map, replacing what was there or adding it at the end.
+     *
+     * **This writes into the map itself**, which every copy of the value shares -- it is how a host
+     * builds a map after constructing it. On anything but a map it does nothing.
+     */
+    put(self, key: string, v: Value) = self match
+        Obj(es) ->
+            var done = false
+
+            for i in 0..<es.len()
+                if es.at(i).key == key then
+                    es.set(i, Entry(key, v))
+                    done = true
+                    break
+
+            if !done then es.push(Entry(key, v))
+        _ -> ()
+
+    /** Append to a list, in place, as `put` does for a map. On anything but a list it does nothing. */
+    push(self, v: Value) = self match
+        List(xs) -> xs.push(v)
+        _ -> ()
+end Value
+
+/** An empty map, to `put` into. */
+new_obj() -> Value = Obj(buf())
+
+/** An empty list, to `push` onto. */
+new_list() -> Value = List(buf())
+
+/** A list holding these values, in order. */
+list_of(items: []const Value) -> Value
+    val xs: Buf[Value] = buf()
+
+    for v in items do xs.push(v)
+    List(xs)
+
+/** A list of strings, which is what front matter's `tags = [...]` and a `split` both are. */
+strings_of(items: []const string) -> Value
+    val xs: Buf[Value] = buf()
+
+    for s in items do xs.push(Str(s))
+    List(xs)
+
+impl Eq for Value
+    /** Equality as `=` in a template means it.
+     *
+     * **Numbers compare by value across `Int` and `Real`**, so `3 = 3.0`; lists and maps compare
+     * element by element, and two maps are equal when they hold the same keys with equal values in
+     * any order. A lambda equals nothing, itself included, because an unevaluated expression has no
+     * value to compare.
+     */
+    eq(self, rhs: Value) -> bool = self match
+        Null -> rhs match
+            Null -> true
+            _ -> false
+        Bool(a) -> rhs match
+            Bool(b) -> a == b
+            _ -> false
+        Int(a) -> rhs match
+            Int(b) -> a == b
+            Real(y) -> int_vs_real(a, y) == 0
+            _ -> false
+        Real(x) -> rhs match
+            Int(b) -> int_vs_real(b, x) == 0
+            Real(y) -> x == y
+            _ -> false
+        Str(a) -> rhs match
+            Str(b) -> a == b
+            _ -> false
+        List(xs) -> rhs match
+            List(ys) -> lists_equal(xs, ys)
+            _ -> false
+        Obj(es) -> rhs match
+            Obj(fs) -> maps_equal(es, fs)
+            _ -> false
+        Lambda(_) -> false
+end Value
+
+private lists_equal(xs: Buf[Value], ys: Buf[Value]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if xs.at(i) != ys.at(i) then return false
+
+    true
+
+private maps_equal(es: Buf[Entry], fs: Buf[Entry]) -> bool
+    if es.len() != fs.len() then return false
+
+    val other = Obj(fs)
+
+    for i in 0..<es.len()
+        other.get(es.at(i).key) match
+            Some(v) -> if v != es.at(i).value then return false
+            None -> return false
+
+    true
+
+/** How a value prints where a template writes `{{ … }}`.
+ *
+ * A string prints as itself, `null` as nothing, a number in its shortest form that reads back the
+ * same (`0.75`, `3`, `1e21` as `1000000000000000000000`) and a boolean as `true` or `false`. A list
+ * prints as `[a, b]` and a map as `{k: v}`, with the strings inside them unquoted: what this is for
+ * is a reader looking at a page, not a parser reading it back. `jsonify` is the other question.
+ */
+text_of(v: Value) -> string = v match
+    Str(s) -> s
+    _ ->
+        var b = str_builder()
+
+        write_value(&b, v)
+        b.finish()
+
+/** `text_of`, into a builder that is already gathering a page. */
+write_value(b: *StrBuilder, v: Value)
+    v match
+        Null -> ()
+        Bool(x) -> b.push(if x then "true" else "false")
+        Int(n) -> b.push(str(n))
+        Real(x) -> b.push(str(x))
+        Str(s) -> b.push(s)
+        List(xs) ->
+            b.push("[")
+
+            for i in 0..<xs.len()
+                if i > 0 then b.push(", ")
+
+                write_value(b, xs.at(i))
+
+            b.push("]")
+        Obj(es) ->
+            b.push("{")
+
+            for i in 0..<es.len()
+                if i > 0 then b.push(", ")
+
+                b.push(es.at(i).key)
+                b.push(": ")
+                write_value(b, es.at(i).value)
+
+            b.push("}")
+        Lambda(_) -> b.push("<lambda>")
+end write_value
+
+/** How many characters -- not bytes -- a string holds. */
+char_count(s: string) -> usize
+    var n: usize = 0
+
+    for _ in s.chars do n += 1
+    n

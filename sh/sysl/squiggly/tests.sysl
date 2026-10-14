@@ -1,0 +1,300 @@
+module sh.sysl.squiggly
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The ports of Scala squiggly's BasicTests, VariableTests, LiteralsTests, ArithmeticTests,
+// ComparisonTests and LogicTests, with the same inputs. Where the expected output differs from the
+// Scala suite's, the test says so and the README's "Improvements" list says why.
+
+// -- helpers ----------------------------------------------------------------------------------------
+
+/** A template rendered against `data`; a failure to parse or render fails the test with the
+ * rendered diagnostic, so a test reads as a claim about output.
+ */
+private[squiggly] run(data: Value, text: string) -> string
+    val t = parse("t", text) match
+        Ok(t) -> t
+        Err(e) -> panic(s"expected a template, got:\n${e.render()}")
+
+    engine().render(t, data) match
+        Ok(s) -> s
+        Err(e) -> panic(s"expected a render, got:\n${e.render()}")
+
+/** `run`, with the data written as JSON. */
+private[squiggly] run_json(json: string, text: string) -> string = run(json_value(json), text)
+
+private[squiggly] json_value(json: string) -> Value =
+    from_json(sh.sysl.json.parse(source_of("data.json", json)).unwrap())
+
+/** What is wrong with a template that should not parse or should not render. Panics if it works. */
+private[squiggly] bad(data: Value, text: string) -> string
+    val t = parse("t", text) match
+        Ok(t) -> t
+        Err(e) -> return e.message()
+
+    engine().render(t, data) match
+        Ok(s) -> panic(s"expected an error, but this rendered: `$s`")
+        Err(e) -> e.message()
+
+// -- basics -----------------------------------------------------------------------------------------
+
+@test("text with no tags is copied as it is")
+just_text()
+    assert_eq(run(Null, ""), "")
+    assert_eq(run(Null, "asdf"), "asdf")
+    assert_eq(run(Null, "asdf\n"), "asdf\n")
+    assert_eq(run(Null, "\nasdf\n"), "\nasdf\n")
+    assert_eq(run(Null, "\nasdf"), "\nasdf")
+
+@test("whitespace beside a tag is kept, and a dash trims it")
+trim_markers()
+    assert_eq(run(Int(345), "\nasdf {{ . }} zxcv"), "\nasdf 345 zxcv")
+    assert_eq(run(Int(345), "\nasdf {{- . }} zxcv"), "\nasdf345 zxcv")
+    assert_eq(run(Int(345), "\nasdf {{ . -}} zxcv"), "\nasdf 345zxcv")
+    assert_eq(run(Int(345), "\nasdf {{- . -}} zxcv"), "\nasdf345zxcv")
+
+@test("a trim marker takes the whole run of whitespace, newlines included")
+trim_takes_newlines()
+    assert_eq(run(Null, "a  \n\t {{- 1 -}} \n\n  b"), "a1b")
+    assert_eq(run(Null, "{{ if true -}}\n  yes\n{{- end }}"), "yes")
+
+@test("a dash hard against a number is the number's sign, not a trim marker")
+dash_is_a_sign()
+    assert_eq(run(Null, "a {{-3}} b"), "a -3 b")
+    assert_eq(run(Null, "a {{ 3 -}} b"), "a 3b")
+
+@test("comments: a tag that starts with //, and /* */ or // inside an expression")
+comments()
+    assert_eq(run(Null, "comments {{ // ignored }}{{ 3 /*+ 4*/ + 5 // asdf }}"), "comments 8")
+    assert_eq(run(Null, "a {{// one\n   two\n   three }}b"), "a b")
+    assert_eq(run(Null, "a {{- // trimmed -}} b"), "ab")
+
+@test("a closing delimiter inside a string or a map literal does not close the tag")
+delimiters_inside()
+    assert_eq(run(Null, "{{ '}}' }}"), "}}")
+    assert_eq(run(Null, "{{ {a: {b: 1}} }}"), "{a: {b: 1}}")
+    assert_eq(run(Null, "{{ {a: {b: 1}}.a.b }}"), "1")
+
+@test("other delimiters can be chosen")
+other_delimiters()
+    val t = parse_with("t", "[= .x =] and {{ .x }}", "[=", "=]").unwrap()
+    val data = new_obj()
+
+    data.put("x", Int(7))
+    assert_eq(engine().render(t, data).unwrap(), "7 and {{ .x }}")
+
+// -- variables and paths ----------------------------------------------------------------------------
+
+@test("a path reaches into maps, and `with` moves the dot")
+paths()
+    assert_eq(run_json("{\"a\": {\"b\": 3, \"c\": {\"d\": 4}}}",
+        "{{ .a.b }} {{ .a.c.d }} {{ with .a }}{{ .b }} {{ .c.d }}{{ end }}"), "3 4 3 4")
+
+@test("an assignment can be read back and overwritten")
+assignment()
+    assert_eq(run(Null, "{{ v := 345 }}{{ v }} {{ v := 678 }}{{ v }}"), "345 678")
+
+@test("reading a variable never set is an error that names it")
+unknown_variable()
+    assert_eq(bad(Null, "{{ v := 345 }}{{ asdf }}"), "there is no variable `asdf`")
+
+@test("a missing key, and any key of something missing, is null and prints as nothing")
+missing_is_null()
+    assert_eq(run_json("{\"a\": {\"b\": 3, \"c\": {\"d\": 4}}}", "[{{ .a.d }}]"), "[]")
+    assert_eq(run_json("{\"a\": {}}", "[{{ .a.b.c.d }}]"), "[]")
+    assert_eq(run_json("{\"a\": {}}", "[{{ x := .a.b }}{{ x.c.d }}]"), "[]")
+
+@test("a key wins over a function of the same name")
+key_before_function()
+    assert_eq(run_json("{\"unix\": 123}", "{{ .unix }}"), "123")
+    assert_eq(run_json("{\"unix\": \"2021-10-04T21:16:20.239Z\"}", "{{ .unix }}"), "2021-10-04T21:16:20.239Z")
+    assert_eq(run_json("{\"date\": {\"unix\": \"2021-10-04T21:16:20.239Z\"}}", "{{ .date.unix }}"),
+        "2021-10-04T21:16:20.239Z")
+
+@test("a one-argument function is a field of anything that has no such key")
+function_as_field()
+    assert_eq(run_json("\"2021-10-04T21:16:20.239Z\"", "{{ .unix }}"), "1633382180239")
+    assert_eq(run_json("{\"date\": \"2021-10-04T21:16:20.239Z\"}", "{{ date := .date }}{{ date.unix }}"),
+        "1633382180239")
+
+@test("`$` is the root wherever the dot has moved, and `$name` is a variable")
+root_and_dollar_names()
+    assert_eq(run_json("{\"l\": [1, 2], \"n\": \"x\"}", "{{ for .l }}{{ $.n }}{{ . }}{{ end }}"), "x1x2")
+    assert_eq(run_json("{\"n\": 5}", "{{ with 3 }}{{ $.n }}{{ $ | length }}{{ end }}"), "51")
+    assert_eq(run(Null, "{{ v := 4 }}{{ $v }}"), "4")
+    assert_eq(bad(Null, "{{ $v }}"), "there is no variable `v`")
+
+@test("a variable can be subscripted directly")
+variable_subscript()
+    assert_eq(run_json("[7, 8, 9]", "{{ ys := . }}{{ ys[1] }} {{ (ys)[2] }} {{ ys[-1] }}"), "8 9 9")
+
+@test("a reserved word may be a field name")
+keyword_fields()
+    assert_eq(run_json("{\"for\": 1, \"end\": 2}", "{{ .for }} {{ .end }}"), "1 2")
+
+// -- literals ---------------------------------------------------------------------------------------
+
+@test("string literals, in either quote, with escapes")
+string_literals()
+    assert_eq(run(Null, "strings {{ 'asdf' }}, {{ \"asdf\" }}, {{ 'as\\tdf' }}, {{ 'as\\u03B1df' }}, {{ 'as\\'df' }}"),
+        "strings asdf, asdf, as\tdf, asαdf, as'df")
+    assert_eq(run(Null, "{{ 'a\\\\b' }}"), "a\\b")
+
+@test("null prints as nothing")
+null_literal()
+    assert_eq(run(Null, "nulls {{ null }} are blank"), "nulls  are blank")
+
+@test("map literals, and a key read off one")
+map_literals()
+    assert_eq(run(Null, "maps {{ {} }} {{ { a :123 } }} {{ {a: 3, b: 4} }} {{ {a: 123}.a }} {{ {a: 123}.asdf }} (null)"),
+        "maps {} {a: 123} {a: 3, b: 4} 123  (null)")
+    assert_eq(run(Null, "{{ {'two words': 1} }}"), "{two words: 1}")
+
+@test("list literals, and an element read off one")
+list_literals()
+    assert_eq(run(Null, "sequences {{ [] }} {{ [ 123 ] }} {{ [3, 4] }} {{ [123][0] }}"), "sequences [] [123] [3, 4] 123")
+
+@test("booleans print as words")
+boolean_literals()
+    assert_eq(run_json("{\"t\": true, \"f\": false}", "booleans {{ .t }}, {{ .f }}, {{ true }}, {{ false }}"),
+        "booleans true, false, true, false")
+
+@test("integers")
+integer_literals()
+    assert_eq(run_json("{\"a\": -345, \"b\": 0, \"c\": 345}", "ints {{ .a }} {{ .b }} {{ .c }} {{ -345 }} {{ 0 }} {{ 345 }}"),
+        "ints -345 0 345 -345 0 345")
+
+// Scala squiggly's numbers were BigDecimals and printed this as 6.02214076E+23. A number here is an
+// integer or a double, and a double prints in its shortest form that reads back the same.
+@test("decimals print in the shortest form that reads back")
+decimal_literals()
+    assert_eq(run_json("{\"N\": 6.02214076e23}", "{{ .N }} {{ 6.02214076e23 }}"),
+        "602214076000000000000000 602214076000000000000000")
+    assert_eq(run(Null, "{{ 3.14 }} {{ .5 }} {{ 1.0 }}"), "3.14 0.5 1")
+
+// -- arithmetic -------------------------------------------------------------------------------------
+
+@test("arithmetic, as Scala squiggly's suite has it")
+arithmetic()
+    val cases: []const (string, string) = [
+        ("3 + 4", "7"), ("-3 + 4", "1"), ("3 + -4", "-1"), ("-3 + -4", "-7"), ("3 * 4", "12"),
+        ("3 / 4", "0.75"), ("10 \\ 4", "2"), ("7 mod 4", "3"), ("3 ^ 4", "81"),
+        ("2 ^ 3 ^ 3", "134217728"), ("2 ^ -2", "0.25"), ("3 - 4", "-1"), ("3 + 4 * 5", "23"),
+        ("-3 + 4 * 5", "17"), ("3 + -4 * 5", "-17"), ("3 + 4 * -5", "-17"), ("(3 + 4) * 5", "35"),
+        ("(-3 + 4) * 5", "5"), ("(3 + -4) * 5", "-5"), ("(3 + 4) * -5", "-35"), ("-(3 + 4) * 5", "-35")]
+
+    for (e, want) in cases do assert_eq(run(Null, s"{{ $e }}"), want)
+
+@test("a subtraction from a variable is a subtraction, however it is spaced")
+variable_subtraction()
+    assert_eq(run(Null, "{{ x := 10 }}{{ x - 1 }} {{ x-1 }} {{ x - -1 }}"), "9 9 11")
+
+@test("`-2 ^ 2` is minus four, as in arithmetic")
+negative_power()
+    assert_eq(run(Null, "{{ -2 ^ 2 }} {{ (-2) ^ 2 }}"), "-4 4")
+
+@test("integer arithmetic stays integral, and becomes real only where it must")
+int_and_real()
+    assert_eq(run(Null, "{{ 6 / 2 }} {{ 7 / 2 }} {{ 1.5 * 2 }} {{ 7.5 \\ 2 }} {{ -7 mod 3 }} {{ 7.5 mod 2 }}"),
+        "3 3.5 3 3 -1 1.5")
+    // Past `long`, the sum continues as a double, which prints its shortest round-tripping form.
+    assert_eq(run(Null, "{{ 9223372036854775807 + 1 }}"), "9223372036854776000")
+    assert_eq(run(Null, "{{ 9223372036854775807 + 1 > 9223372036854775807 }}"), "true")
+
+@test("arithmetic on the wrong kind of value is an error at the operator")
+arithmetic_errors()
+    assert_eq(bad(Null, "{{ 'a' + 1 }}"), "`+` needs numbers, and one side is a string")
+    assert_eq(bad(Null, "{{ 1 / 0 }}"), "division by zero")
+    assert_eq(bad(Null, "{{ 1 mod 0 }}"), "division by zero")
+    assert_eq(bad(Null, "{{ -'a' }}"), "`-` needs a number, and this is a string")
+
+@test("`++` joins strings, and lists")
+concat()
+    assert_eq(run(Null, "{{ 'a' ++ 'b' }} {{ 1 ++ 'b' }} {{ 'a' ++ 2 }} {{ [1] ++ [2, 3] }}"), "ab 1b a2 [1, 2, 3]")
+    assert_eq(bad(Null, "{{ 1 ++ 2 }}"), "`++` joins two lists, or a string to anything, and these are a number and a number")
+
+// -- comparison and logic ---------------------------------------------------------------------------
+
+@test("comparisons, as Scala squiggly's suite has them")
+comparisons()
+    val cases: []const (string, string) = [
+        ("3 < 4", "true"), ("3 < 3", "false"), ("3 > 4", "false"), ("3 > 3", "false"),
+        ("3 <= 4", "true"), ("3 <= 3", "true"), ("3 >= 4", "false"), ("3 >= 3", "true"),
+        ("3 = 4", "false"), ("3 = 3", "true"), ("3 != 4", "true"), ("3 != 3", "false"),
+        ("3 div 12", "true"), ("3 div 11", "false"), ("'a' < 'b'", "true"), ("'b' < 'a'", "false"),
+        ("3 = 3.0", "true"), ("[1, 2] = [1, 2]", "true"), ("{a: 1, b: 2} = {b: 2, a: 1}", "true"),
+        ("null = null", "true"), ("'3' = 3", "false")]
+
+    for (e, want) in cases do assert_eq(run(Null, s"{{ $e }}"), want)
+
+@test("a comparison chains, each operand against the next")
+chained_comparison()
+    val cases: []const (string, string) = [
+        ("3 < .a < 7", "true"), ("5 < .a < 7", "false"), ("3 < .a < 5", "false"),
+        ("3 < .a <= 5", "true"), ("5 <= .a < 7", "true")]
+
+    for (e, want) in cases do assert_eq(run_json("{\"a\": 5}", s"{{ $e }}"), want)
+
+@test("ordering a string against a number is an error")
+comparison_errors()
+    assert_eq(bad(Null, "{{ 'asdf' < 3 }}"), "a string and a number cannot be put in order")
+    assert_eq(bad(Null, "{{ 3 < 'asdf' }}"), "a number and a string cannot be put in order")
+
+@test("and, or, not, as Scala squiggly's suite has them")
+logic()
+    val cases: []const (string, string) = [
+        ("true and true", "true"), ("true and false", "false"), ("false and true", "false"),
+        ("false and false", "false"), ("false or false", "false"), ("false or true", "true"),
+        ("true or true", "true"), ("true or false", "true"), ("true or true and true", "true"),
+        ("true or true and false", "true"), ("(true or true) and false", "false"), ("not true", "false"),
+        ("not false", "true"), ("not 3 < 4", "false"), ("not 4 < 3", "true"),
+        ("3 < 4 or 3 < 4 and 4 < 3", "true"), ("3 < 4 + 5 or 3 < 4 + 5 and 4 + 5 < 3", "true")]
+
+    for (e, want) in cases do assert_eq(run(Null, s"{{ $e }}"), want)
+
+@test("`or` and `and` answer the operand that decided, so `or` gives a default")
+logic_answers_operands()
+    assert_eq(run_json("{\"t\": \"\"}", "{{ .t or 'Untitled' }}|{{ .title or 'Untitled' }}"), "Untitled|Untitled")
+    assert_eq(run_json("{\"t\": \"Mine\"}", "{{ .t or 'Untitled' }}"), "Mine")
+    assert_eq(run(Null, "{{ 0 and 1 }} {{ 2 and 3 }}"), "0 3")
+
+@test("`and` and `or` do not evaluate a side they do not need")
+logic_short_circuits()
+    assert_eq(run(Null, "{{ false and nosuch }} {{ true or nosuch }}"), "false true")
+
+@test("`if … then … else …` is an expression")
+conditional_expression()
+    assert_eq(run_json("{\"a\": 1}", "{{ if .a then 'yes' else 'no' }}{{ if .b then 'yes' else 'no' }}"), "yesno")
+    assert_eq(run(Null, "[{{ if false then 'x' }}]"), "[]")
+    assert_eq(run(Null, "{{ x := if 1 > 2 then 'a' else if 2 > 1 then 'b' else 'c' }}{{ x }}"), "b")
+
+@test("truthiness: null, false, zero, and empty things are false")
+truthiness()
+    assert_eq(run(Null, "{{ for v <- [null, false, 0, 0.0, '', [], {}, 1, 'x', [0], {a: 0}, true] }}{{ if v then 'T' else 'F' }}{{ end }}"),
+        "FFFFFFFTTTTT")
+
+// -- edges ------------------------------------------------------------------------------------------
+
+@test("text beside tags keeps its multi-byte characters")
+multibyte_text()
+    assert_eq(run(Null, "é{{ 1 }}ñ{{- ' ü ' -}}ö"), "é1ñ ü ö")
+
+@test("tags hard against each other, and a trim between them")
+adjacent_tags()
+    assert_eq(run(Null, "{{ 1 }}{{ 2 }}{{ 3 -}}  {{- 4 }}"), "1234")
+
+@test("a loop's names keep their last values after it")
+loop_names_persist()
+    assert_eq(run(Null, "{{ for x, i <- [5, 6] }}{{ end }}{{ x }}{{ i }}"), "61")
+
+@test("a lambda printed is said to be one")
+lambda_prints()
+    assert_eq(run(Null, "{{ `1` }}"), "<lambda>")
+
+@test("a tag opened at the very end is unclosed")
+open_at_end()
+    assert_eq(bad(Null, "abc{{"), "this tag is never closed")
+    assert_eq(bad(Null, "abc{{-"), "this tag is never closed")

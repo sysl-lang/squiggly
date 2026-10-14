@@ -1,0 +1,357 @@
+module sh.sysl.squiggly
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.{format_int, format_real}
+import sysl.text.{Ascii, Search, str_builder, to_lower}
+import sysl.time.{LocalDateTime, Offset, Weekday, at_offset, day_of, day_of_year, hour_of, minute_of,
+                  month_name, month_of, offset_text, parse_date, parse_datetime, parse_offset,
+                  parse_timestamp, second_of, us_of, weekday, weekday_name, year_of, LocalTime}
+
+// The three formatters that are more than a line: `printf`, dates, and slugs.
+
+// -- printf ----------------------------------------------------------------------------------------
+
+/** `printf`'s text: `%d`, `%s`, `%f`, `%x`, `%X`, `%o`, `%e`, `%g`, `%b` and `%%`, with C's flags,
+ * width and precision, and Java's `,` for thousands separators on `%d`.
+ *
+ * The conversions are C's, rendered by `sysl.fmt` rather than by the C library, so a value prints
+ * the same everywhere. A number goes where a number is asked for whichever kind it is -- `%d` of
+ * `3.9` is `3`, `%f` of `3` is `3.000000` -- and `%s` takes anything, as it prints.
+ */
+printf(fmt: string, args: Buf[Value]) -> Result[string, string]
+    var b = str_builder()
+    val f = fmt.bytes
+    var i: usize = 0
+    var next: usize = 0
+
+    while i < f.len
+        if f[i] != u8('%') then
+            val start = i
+
+            while i < f.len && f[i] != u8('%') do i += 1
+
+            b.push(fmt[start..<i])
+            continue
+
+        if i + 1 < f.len && f[i + 1] == u8('%') then
+            b.push("%")
+            i += 2
+            continue
+
+        val start = i
+
+        i += 1
+
+        while i < f.len && "-+ 0#,".has_byte(f[i]) do i += 1
+        while i < f.len && f[i].is_digit() do i += 1
+
+        if i < f.len && f[i] == u8('.') then
+            i += 1
+
+            while i < f.len && f[i].is_digit() do i += 1
+
+        if i >= f.len then return Err(s"the specifier at ${start} has no conversion letter")
+
+        val conv = f[i]
+
+        i += 1
+
+        if next >= args.len() then return Err(s"`${fmt[start..<i]}` has no argument left to format")
+
+        b.push(conversion(fmt[start..<i], conv, args[next])?)
+        next += 1
+
+    Ok(b.finish())
+end printf
+
+private conversion(spec: string, conv: u8, v: Value) -> Result[string, string]
+    val grouped = spec.contains(",")
+    val c_spec = sysl.text.replace_all(spec, ",", "")
+
+    if conv == u8('s') then return Ok(pad_spec(c_spec, text_of(v)))
+    if conv == u8('b') then return Ok(pad_spec(c_spec, if v.truthy() then "true" else "false"))
+
+    val n = v match
+        Int(n) -> Some(n)
+        Real(x) -> Some(long(x))
+        _ -> None
+
+    val x = as_real(v)
+
+    if x.is_none() then return Err(s"`$spec` needs a number, and was given ${v.kind()}")
+
+    if conv == u8('d') || conv == u8('x') || conv == u8('X') || conv == u8('o') then
+        val text = format_int(i128(n.unwrap()), 64, c_spec, 0, -1)
+
+        return Ok(if grouped && conv == u8('d') then group_thousands(text) else text)
+
+    if conv == u8('f') || conv == u8('e') || conv == u8('g') || conv == u8('E') || conv == u8('G') then
+        return Ok(format_real(x.unwrap(), c_spec, 0, -1))
+
+    Err(s"`$spec` is not a conversion printf knows")
+end conversion
+
+// `%-10s` and `%10s`: C's string padding, which `sysl.fmt` has no entry for because a `string`
+// renders itself.
+private pad_spec(spec: string, text: string) -> string
+    val b = spec.bytes
+    var left = false
+    var width: usize = 0
+    var i: usize = 1
+
+    while i < b.len && "-+ 0#".has_byte(b[i])
+        if b[i] == u8('-') then left = true
+
+        i += 1
+
+    while i < b.len && b[i].is_digit()
+        width = width * 10 + usize(b[i] - 48)
+        i += 1
+
+    val n = char_count(text)
+
+    if n >= width then return text
+
+    val pad = sysl.text.repeat(" ", width - n)
+
+    if left then text + pad else pad + text
+
+// Commas between each three digits of the run of digits in `text`, which keeps any sign and padding.
+private group_thousands(text: string) -> string
+    val b = text.bytes
+    var lo: usize = 0
+
+    while lo < b.len && !b[lo].is_digit() do lo += 1
+
+    var hi = lo
+
+    while hi < b.len && b[hi].is_digit() do hi += 1
+
+    var out = str_builder()
+
+    out.push(text[0..<lo])
+
+    for k in lo..<hi
+        if k > lo && (hi - k) % 3 == 0 then out.push(",")
+
+        out.push_char(char(u32(b[k])))
+
+    out.push(text[hi..<b.len])
+    out.finish()
+
+// -- dates -----------------------------------------------------------------------------------------
+
+// A date read from text: the wall-clock reading, and the offset it was written with if it had one.
+private struct When
+    local: LocalDateTime
+    offset: Option[Offset]
+
+// `2024-03-12`, `2024-03-12T09:30:00`, `2024-03-12 09:30`, or any of those with `Z` or `+05:30`.
+private read_when(s: string) -> Result[When, string]
+    parse_timestamp(s) match
+        Ok(instant) ->
+            val o =
+                if s.ends_with("Z") || s.ends_with("z") then Offset(0)
+                else parse_offset(s[s.len - 6..<s.len]).unwrap_or(Offset(0))
+
+            return Ok(When(at_offset(instant, o), Some(o)))
+        Err(_) -> ()
+
+    parse_datetime(s) match
+        Ok(ldt) -> return Ok(When(ldt, None))
+        Err(_) -> ()
+
+    parse_date(s) match
+        Ok(d) -> Ok(When(LocalDateTime(d, LocalTime(0)), None))
+        Err(_) -> Err(s"`$s` is not a date: a date is written `2024-03-12`, and a time after it `T09:30:00Z`")
+
+/** Milliseconds from 1970-01-01T00:00:00Z to the date written; a date with no offset is read as UTC. */
+unix_millis(s: string) -> Result[long, string]
+    val w = read_when(s)?
+    val minutes = w.offset.map(o -> long(o.minutes)).unwrap_or(0)
+    val us = long(w.local.date.day) * 86400000000 + w.local.time.us - minutes * 60000000
+
+    // Toward minus infinity, so an instant before 1970 is not a millisecond late.
+    Ok(if us < 0 && us % 1000 != 0 then us / 1000 - 1 else us / 1000)
+
+/** A date written out by a pattern.
+ *
+ * The pattern letters are `java.time`'s, which is what juicer's themes were written against: `yyyy`
+ * or `uuuu` the year and `yy` its last two digits, `M` `MM` `MMM` `MMMM` the month as `3`, `03`,
+ * `Mar`, `March`, `d` `dd` the day, `E`/`EEE` and `EEEE` the weekday as `Tue` and `Tuesday`, `D` the
+ * day of the year, `H` `HH` the hour of a 24-hour clock and `h` `hh` of a 12-hour one, `a` `AM` or
+ * `PM`, `m` `mm` minutes, `s` `ss` seconds, `S…` a fraction to as many digits as there are `S`s,
+ * and `XXX` the offset as `Z` or `+05:30`. Text in single quotes is copied, `''` is a quote, and
+ * anything that is not a letter is copied as it is.
+ *
+ * Four names stand for whole patterns: `:date_full` (`Tuesday, March 12, 2024`), `:date_long`
+ * (`March 12, 2024`), `:date_medium` (`Mar 12, 2024`) and `:date_short` (`3/12/24`).
+ */
+format_date(pattern: string, when: string) -> Result[string, string]
+    val p = pattern match
+        ":date_full" -> "EEEE, MMMM d, uuuu"
+        ":date_long" -> "MMMM d, uuuu"
+        ":date_medium" -> "MMM d, uuuu"
+        ":date_short" -> "M/d/uu"
+        _ -> pattern
+
+    val w = read_when(when)?
+    val d = w.local.date
+    val t = w.local.time
+    var b = str_builder()
+    val f = p.bytes
+    var i: usize = 0
+
+    while i < f.len
+        val ch = f[i]
+
+        if ch == u8('\'') then
+            if i + 1 < f.len && f[i + 1] == u8('\'') then
+                b.push("'")
+                i += 2
+                continue
+
+            i += 1
+
+            while i < f.len && f[i] != u8('\'')
+                b.push_char(char(u32(f[i])))
+                i += 1
+
+            i += 1
+            continue
+
+        if !ch.is_alpha() then
+            val start = i
+
+            while i < f.len && !f[i].is_alpha() && f[i] != u8('\'') do i += 1
+
+            b.push(p[start..<i])
+            continue
+
+        var n: usize = 0
+
+        while i < f.len && f[i] == ch
+            n += 1
+            i += 1
+
+        val year = year_of(d)
+        val hour = hour_of(t)
+
+        char(u32(ch)) match
+            'y' -> b.push(if n == 2 then two(year % 100) else padded(year, n))
+            'u' -> b.push(if n == 2 then two(year % 100) else padded(year, n))
+            'M' -> b.push(month_text(month_of(d), n))
+            'L' -> b.push(month_text(month_of(d), n))
+            'd' -> b.push(padded(day_of(d), n))
+            'D' -> b.push(padded(day_of_year(d), n))
+            'E' -> b.push(if n >= 4 then weekday_name(weekday(d)) else weekday_name(weekday(d))[0..<3])
+            'H' -> b.push(padded(hour, n))
+            'h' -> b.push(padded(if hour % 12 == 0 then 12 else hour % 12, n))
+            'a' -> b.push(if hour < 12 then "AM" else "PM")
+            'm' -> b.push(padded(minute_of(t), n))
+            's' -> b.push(padded(second_of(t), n))
+            'S' -> b.push(fraction(us_of(t), n))
+            'X' -> b.push(w.offset match
+                Some(o) -> offset_text(o)
+                None -> "Z")
+            _ -> return Err(s"`${p[i - n..<i]}` is not a pattern letter `format` knows")
+
+    Ok(b.finish())
+end format_date
+
+private month_text(m: int, n: usize) -> string =
+    if n >= 4 then month_name(m)
+    elif n == 3 then month_name(m)[0..<3]
+    else padded(m, n)
+
+private two(n: int) -> string = padded(n, 2)
+
+// `n` written in at least `width` digits, with leading zeros.
+private padded(n: int, width: usize) -> string
+    val digits = str(if n < 0 then -n else n)
+    val zeros = if digits.len < width then sysl.text.repeat("0", width - digits.len) else ""
+
+    (if n < 0 then "-" else "") + zeros + digits
+
+// The first `n` digits of a fraction of a second held in microseconds.
+private fraction(us: long, n: usize) -> string
+    val six = padded(int(us), 6)
+
+    if n <= 6 then six[0..<n] else six + sysl.text.repeat("0", n - 6)
+
+// -- slugs -----------------------------------------------------------------------------------------
+
+/** Text made into a URL path segment: lower case, the common Latin accents folded to their
+ * letters (`é` to `e`, `ß` to `ss`), every run of anything else turned into one `-`, and no `-` at
+ * either end. Text with nothing left is `-`, so the result is always a usable segment.
+ *
+ *     slugify("Hello, World!") == "hello-world"
+ *     slugify("Café au lait")  == "cafe-au-lait"
+ */
+slugify(s: string) -> string
+    var b = str_builder()
+    var dash = false
+    var any = false
+
+    for ch in to_lower(s).chars
+        val folded = fold(ch)
+
+        for x in folded.bytes
+            if x.is_lower() || x.is_digit() then
+                if dash && any then b.push("-")
+
+                b.push_char(char(u32(x)))
+                dash = false
+                any = true
+            else
+                dash = true
+
+    val out = b.finish()
+
+    if out.len == 0 then "-" else out
+
+// The letters a Latin accented letter is written as in a URL; anything else as itself.
+private fold(ch: char) -> string
+    val c = u32(ch)
+
+    if c < 0xc0 then return str(ch)
+
+    val pairs: []const string = [
+        "àa", "áa", "âa", "ãa", "äa", "åa", "āa", "ăa", "ąa", "çc", "ćc", "čc", "ďd", "èe", "ée", "êe",
+        "ëe", "ēe", "ėe", "ęe", "ěe", "ğg", "ìi", "íi", "îi", "ïi", "īi", "įi", "ıi", "łl", "ľl", "ñn",
+        "ńn", "ňn", "òo", "óo", "ôo", "õo", "öo", "øo", "ōo", "őo", "ŕr", "řr", "śs", "šs", "şs", "ťt",
+        "ţt", "ùu", "úu", "ûu", "üu", "ūu", "ůu", "űu", "ýy", "ÿy", "źz", "żz", "žz", "ßss", "æae",
+        "œoe", "ðd", "þth"]
+
+    for p in pairs
+        val first = p.chars.peek().unwrap()
+
+        if first == ch then return p[str(first).len..<p.len]
+
+    str(ch)
+
+/** Text made into a URL segment the way Hugo's `urlize` does: trimmed, each space a `-` (but never
+ * two in a row), and anything that is neither a letter nor a digit dropped. Case is kept. Empty
+ * text is `-`.
+ */
+urlize(s: string) -> string
+    val t = s.trim()
+
+    if t.len == 0 then return "-"
+
+    var b = str_builder()
+    var last_dash = false
+
+    for ch in t.chars
+        val c = u32(ch)
+
+        if ch == ' ' then
+            if !last_dash then
+                b.push("-")
+                last_dash = true
+        elif c >= 128 || (c < 128 && u8(c).is_alnum()) then
+            b.push_char(ch)
+            last_dash = false
+
+    b.finish()
+end urlize

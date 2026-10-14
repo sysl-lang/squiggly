@@ -1,0 +1,233 @@
+module sh.sysl.squiggly
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{StrBuilder, str_builder}
+
+// What a template is once it has been read: a tree of nodes, each tag's expression a tree of its
+// own, and every node and expression carrying the span it was read from, so an error found while
+// rendering names the line and column the way a parse error does.
+
+/** A binary operator. `and` and `or` are here too, though they evaluate their right side only when
+ * they need it.
+ */
+enum Op
+    Add
+    Sub
+    Mul
+    Div
+    Quot
+    Mod
+    Pow
+    Concat
+    And
+    Or
+
+/** A comparison, which chains: `1 < x <= 9` is two of these over three operands. */
+enum Cmp
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+    Divides
+
+/** An expression, as written inside a tag. Every variant opens with the span it was read from. */
+enum Expr
+    /** A literal, already a value: a number, a string, `true`, `false`, `null`. */
+    Lit(at: Span, v: Value)
+    /** `.`, `.a.b`, `$`, `$.a.b` -- a path from the current value or from the root. */
+    Path(at: Span, root: bool, names: Buf[string])
+    /** A bare name: a variable, or a function called with no arguments. */
+    Var(at: Span, name: string)
+    /** `$name`: a variable and only a variable. */
+    GVar(at: Span, name: string)
+    ListLit(at: Span, items: Buf[Expr])
+    MapLit(at: Span, keys: Buf[string], vals: Buf[Expr])
+    Neg(at: Span, e: &Expr)
+    Not(at: Span, e: &Expr)
+    Bin(at: Span, op: Op, l: &Expr, r: &Expr)
+    Compare(at: Span, first: &Expr, ops: Buf[Cmp], rest: Buf[Expr])
+    Cond(at: Span, c: &Expr, yes: &Expr, no: Option[&Expr])
+    /** `e.name`, written with no space before the dot: a map's key, or a one-argument function. */
+    Field(at: Span, e: &Expr, name: string)
+    /** `e[i]`, written with no space before the bracket. */
+    Index(at: Span, e: &Expr, i: &Expr)
+    /** `f a b`, and `x | f a` once the pipe has put `x` last. */
+    Call(at: Span, name: string, args: Buf[Expr])
+    /** `` `e` `` -- evaluated by the function it is handed, not where it is written. */
+    Quote(at: Span, e: &Expr)
+
+    /** Where this was read from. */
+    span(self) -> Span = self match
+        Lit(a, _) -> a
+        Path(a, _, _) -> a
+        Var(a, _) -> a
+        GVar(a, _) -> a
+        ListLit(a, _) -> a
+        MapLit(a, _, _) -> a
+        Neg(a, _) -> a
+        Not(a, _) -> a
+        Bin(a, _, _, _) -> a
+        Compare(a, _, _, _) -> a
+        Cond(a, _, _, _) -> a
+        Field(a, _, _) -> a
+        Index(a, _, _) -> a
+        Call(a, _, _) -> a
+        Quote(a, _) -> a
+end Expr
+
+/** One arm of an `if` (its condition) or of a `match` (the values a `case` names). */
+struct Arm
+    tests: Buf[Expr]
+    body: Buf[Node]
+
+/** A piece of a template: text to copy, or a tag and what it encloses. */
+enum Node
+    Text(s: string)
+    Out(e: Expr)
+    Assign(at: Span, name: string, e: Expr)
+    Return(at: Span, e: Option[Expr])
+    If(arms: Buf[Arm], els: Option[Buf[Node]])
+    Match(at: Span, e: Expr, arms: Buf[Arm], els: Option[Buf[Node]])
+    For(at: Span, first: string, second: string, e: Expr, body: Buf[Node], els: Option[Buf[Node]])
+    With(at: Span, e: Expr, body: Buf[Node], els: Option[Buf[Node]])
+    Define(name: string)
+    Block(at: Span, name: string, e: Expr, body: Buf[Node])
+
+/** A parsed template: its source, for the errors it will report, its body, and the `define`s in it.
+ *
+ * **The `define`s are collected while parsing**, so a layout can take a page's blocks without the
+ * page being rendered first. In Scala squiggly a `define` took effect when rendering reached it,
+ * which meant rendering the page once and throwing the output away, and a block a page did *not*
+ * define kept whatever the previous page had put there.
+ */
+struct Template
+    src: Source
+    body: Buf[Node]
+    defines: Map[string, Buf[Node]]
+
+    /** The template's name, as it was given to `parse`. */
+    name(self) -> string = self.src.name
+
+    /** Whether the template defines a block of this name. */
+    defines_block(self, name: string) -> bool = self.defines.has(name)
+end Template
+
+/** An expression written out in a prefix form, `(+ 1 (* 2 3))`, which is how a test says what a
+ * tag parsed to without building the tree by hand.
+ */
+show_expr(e: Expr) -> string
+    var b = str_builder()
+
+    write_expr(&b, e)
+    b.finish()
+
+private write_expr(b: *StrBuilder, e: Expr)
+    e match
+        Lit(_, v) -> v match
+            Str(s) -> b.push(s"'$s'")
+            Null -> b.push("null")
+            _ -> write_value(b, v)
+        Path(_, root, names) ->
+            b.push(if root then "$" else "")
+
+            if names.len() == 0 then b.push(".")
+
+            for n in names
+                b.push(".")
+                b.push(n)
+        Var(_, n) -> b.push(n)
+        GVar(_, n) -> b.push(s"$$$n")
+        ListLit(_, items) ->
+            b.push("[")
+            write_list(b, items)
+            b.push("]")
+        MapLit(_, keys, vals) ->
+            b.push("{")
+
+            for i in 0..<keys.len()
+                if i > 0 then b.push(" ")
+
+                b.push(keys[i])
+                b.push(": ")
+                write_expr(b, vals[i])
+
+            b.push("}")
+        Neg(_, x) -> group(b, "neg", [*x])
+        Not(_, x) -> group(b, "not", [*x])
+        Bin(_, op, l, r) -> group(b, op_text(op), [*l, *r])
+        Compare(_, first, ops, rest) ->
+            b.push("(")
+            write_expr(b, *first)
+
+            for i in 0..<ops.len()
+                b.push(" ")
+                b.push(cmp_text(ops[i]))
+                b.push(" ")
+                write_expr(b, rest[i])
+
+            b.push(")")
+        Cond(_, c, yes, no) -> no match
+            Some(n) -> group(b, "if", [*c, *yes, *n])
+            None -> group(b, "if", [*c, *yes])
+        Field(_, x, n) ->
+            write_expr(b, *x)
+            b.push(":")
+            b.push(n)
+        Index(_, x, i) -> group(b, "at", [*x, *i])
+        Call(_, n, args) ->
+            b.push("(")
+            b.push(n)
+
+            for a in args
+                b.push(" ")
+                write_expr(b, a)
+
+            b.push(")")
+        Quote(_, x) ->
+            b.push("`")
+            write_expr(b, *x)
+            b.push("`")
+end write_expr
+
+private write_list(b: *StrBuilder, items: Buf[Expr])
+    for i in 0..<items.len()
+        if i > 0 then b.push(" ")
+
+        write_expr(b, items[i])
+
+private group(b: *StrBuilder, head: string, parts: []const Expr)
+    b.push("(")
+    b.push(head)
+
+    for p in parts
+        b.push(" ")
+        write_expr(b, p)
+
+    b.push(")")
+
+/** The operator as a template writes it. */
+op_text(op: Op) -> string = op match
+    Add -> "+"
+    Sub -> "-"
+    Mul -> "*"
+    Div -> "/"
+    Quot -> "\\"
+    Mod -> "mod"
+    Pow -> "^"
+    Concat -> "++"
+    And -> "and"
+    Or -> "or"
+
+/** The comparison as a template writes it. */
+cmp_text(c: Cmp) -> string = c match
+    Eq -> "="
+    Ne -> "!="
+    Lt -> "<"
+    Le -> "<="
+    Gt -> ">"
+    Ge -> ">="
+    Divides -> "div"

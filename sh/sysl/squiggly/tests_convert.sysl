@@ -1,0 +1,67 @@
+module sh.sysl.squiggly
+@tests
+
+import sh.sysl.parsing.source_of
+
+// The conversions into a template value, and the value's own API, which is what a host builds
+// data with.
+
+private toml_value(text: string) -> Value = from_toml(sh.sysl.toml.parse(source_of("front.toml", text)).unwrap())
+
+@test("TOML front matter converts, in the order it was written")
+toml_converts()
+    val v = toml_value("title = \"Hi\"\ncount = 3\nratio = 0.5\ndraft = false\ntags = [\"a\", \"b\"]\n[params]\nz = 1\na = 2\n")
+
+    assert_eq(run(v, "{{ .title }} {{ .count + 1 }} {{ .ratio }} {{ .draft }} {{ .tags }} {{ for k, x <- .params }}{{ k }}{{ x }}{{ end }}"),
+        "Hi 4 0.5 false [a, b] z1a2")
+
+@test("TOML dates become ISO 8601 text, which format reads")
+toml_dates()
+    val v = toml_value("a = 2024-03-12\nb = 2024-03-12T09:30:00\nc = 2024-03-12T09:30:00-07:00\nd = 09:30:00\ne = 2024-03-12T09:30:00.5Z\n")
+
+    assert_eq(run(v, "{{ .a }}|{{ .b }}|{{ .c }}|{{ .d }}|{{ .e }}"),
+        "2024-03-12|2024-03-12T09:30:00|2024-03-12T09:30:00-07:00|09:30:00|2024-03-12T09:30:00.500000Z")
+    assert_eq(run(v, "{{ format ':date_long' .c }} {{ format 'HH:mm XXX' .c }}"), "March 12, 2024 09:30 -07:00")
+
+@test("JSON converts, null and a number past 64 bits included")
+json_converts()
+    val v = json_value("{\"n\": null, \"big\": 123456789012345678901234567890, \"xs\": [1, 2.5, \"s\", true]}")
+
+    assert_eq(run(v, "[{{ .n }}] {{ .big > 1e29 }} {{ .xs }}"), "[] true [1, 2.5, s, true]")
+
+@test("a host builds a value with put and push, and put replaces in place")
+building_values()
+    val page = new_obj()
+    val tags = new_list()
+
+    tags.push(Str("x"))
+    page.put("title", Str("One"))
+    page.put("tags", tags)
+    page.put("title", Str("Two"))
+    tags.push(Str("y"))
+
+    assert_eq(run(page, "{{ .title }} {{ .tags }} {{ length . }}"), "Two [x, y] 2")
+    assert_eq(text_of(list_of([Int(1), strings_of(["a"])])), "[1, [a]]")
+
+@test("a value says what it holds")
+value_queries()
+    val m = new_obj()
+
+    m.put("a", Int(1))
+    assert(m.get("a") == Some(Int(1)))
+    assert(m.get("b").is_none())
+    assert(list_of([Int(5)]).at(0) == Some(Int(5)))
+    assert(list_of([Int(5)]).at(1).is_none())
+    assert_eq(Str("añb").len(), 3usize)
+    assert_eq(Real(2.0).kind(), "a number")
+    assert(Int(2) == Real(2.0))
+    assert(Int(9007199254740993) != Real(9007199254740992.0))
+
+@test("the README's example renders what it says")
+readme_example()
+    val t = parse("hello.html", "<h1>{{ .title }}</h1>{{ for t <- .tags }} #{{ t }}{{ end }}").unwrap()
+    val data = new_obj()
+
+    data.put("title", Str("Notes"))
+    data.put("tags", strings_of(["sysl", "templates"]))
+    assert_eq(engine().render(t, data).unwrap(), "<h1>Notes</h1> #sysl #templates")
