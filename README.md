@@ -6,7 +6,7 @@ language juicer's themes are written in — Go templates and Liquid in spirit �
 
 ```
 dependencies {
-  squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.0" }
+  squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.1" }
 }
 ```
 
@@ -150,7 +150,8 @@ package opens nothing and reads no clock, and `requires` only `heap`.
    not).
 7. **`or` and `and` answer an operand**, so `.title or 'Untitled'` is a default.
 8. **Integers are integers.** BigDecimal printed `1.5 * 2` as `3.0` and `6.02214076e23` as
-   `6.02214076E+23`; here `3` and `602214076000000000000000`. (*Changed: LiteralsTests "decimal".*)
+   `6.02214076E+23`; here `3` and `602214076000000000000000`. (*Changed: LiteralsTests "decimal",
+   and TagParserTests "literals/scientific", where `6.02e23` reads `602000000000000000000000`.*)
 9. **A negative index counts from the end**: `xs[-1]`. (*Changed: IndexTests 2 and 8, which expected
    an error.*)
 10. **`round` takes a half away from zero**: `round 2.5` is `3`. (*Changed: BuiltinTests "round".*)
@@ -169,7 +170,10 @@ package opens nothing and reads no clock, and `requires` only `heap`.
     and `unix` read directly). (*Changed: BuiltinTests' `time`/`now`/`markdownify`/`emojify`/
     `fileExists` tests, rewritten or dropped.*)
 17. **Regular expressions are POSIX ERE**, sysl's engine, which has no lazy `+?`. (*Changed:
-    BuiltinTests "findRE (with groups)" uses `[^<]+`.*)
+    BuiltinTests "findRE (with groups)" and "findRE indexed access" use `[^<]+` for `.+?`.*)
+18. **Error messages are worded afresh**, each naming a line and a column; where a Scala test expected
+    an error, the port expects the same refusal in the new words. A missing value prints as `(null)`,
+    not `(undefined)`.
 
 ## Migration: Scala squiggly → sysl squiggly
 
@@ -204,7 +208,7 @@ wants it.
 
 ## Tests
 
-`sysl test .` — 153 tests: every Scala squiggly test ported (with the changed expectations above
+`sysl test .` — 154 tests: every Scala squiggly test ported (with the changed expectations above
 named where they are), the parse and render errors with their places, every builtin's answer and
 refusal, the conversions, and the corpus. The suite passes under
 `SYSL_EXTRA_CFLAGS="-fsanitize=address -g"`; the package is pure sysl, so all of it is instrumented.

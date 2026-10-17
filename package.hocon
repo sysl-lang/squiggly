@@ -9,14 +9,14 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.0" }
+//       squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `squiggly`; the module a program imports is `sh.sysl.squiggly`.
 
 package {
   name    = "squiggly"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // **The oldest compiler this builds with**, which is the one it was written and tested against.
   sysl = "0.1.0-alpha.12"

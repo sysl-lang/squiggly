@@ -160,6 +160,15 @@ tag_shapes()
     assert_eq(shape("{{ if x then 1 else 2 }}"), "out (if x 1 2)")
     assert_eq(parse("t", "{{ // some comment }}").unwrap().body.len(), 0)
 
+// `end` is a tag of its own: it closes the innermost block, the text after it belongs to the
+// enclosing body, and one with nothing open is refused where it stands.
+@test("an end tag closes its block and nothing more")
+end_tag()
+    val t = parse("t", "{{ if x }}a{{ end }}b").unwrap()
+    assert_eq(t.body.len(), 2)
+    assert_eq(shape("{{ if x }}{{ for .l }}{{ end }}{{ end }}"), "if x arms=1 else=false")
+    assert_eq(parse_error("a{{ end }}"), "t.html:1:2: there is no block for this `end` to close")
+
 // -- index ------------------------------------------------------------------------------------------
 
 @test("indexing a list, a map and a string")
