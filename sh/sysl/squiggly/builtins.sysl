@@ -250,7 +250,7 @@ private b_capitalize(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
 
     if cs.len() == 0 then return Ok(Str(s))
 
-    Ok(Str(to_upper(str(cs[0])) + to_lower(from_chars(cs, 1, cs.len()))))
+    Ok(Str(to_upper(cs[0].to_string()) + to_lower(from_chars(cs, 1, cs.len()))))
 
 private b_lower(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(to_lower(want_str(a, 0)?)))
 private b_upper(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = Ok(Str(to_upper(want_str(a, 0)?)))
@@ -321,7 +321,7 @@ private b_split(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
     if sep.len == 0 then
         val out: Buf[Value] = buf()
 
-        for ch in s.chars do out.push(Str(str(ch)))
+        for ch in s.chars do out.push(Str(ch.to_string()))
 
         return Ok(List(out))
 
@@ -467,8 +467,8 @@ write_json(b: *sysl.text.StrBuilder, v: Value)
         Null -> b.push("null")
         Lambda(_) -> b.push("null")
         Bool(x) -> b.push(if x then "true" else "false")
-        Int(n) -> b.push(str(n))
-        Real(x) -> b.push(if x.is_finite() then str(x) else "null")
+        Int(n) -> b.push(n.to_string())
+        Real(x) -> b.push(if x.is_finite() then x.to_string() else "null")
         Str(s) ->
             b.push("\"")
             json_escape(b, s)
@@ -733,7 +733,7 @@ private b_to_seq(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail] = a[0] match
     Str(s) ->
         val out: Buf[Value] = buf()
 
-        for ch in s.chars do out.push(Str(str(ch)))
+        for ch in s.chars do out.push(Str(ch.to_string()))
 
         Ok(List(out))
     Null -> Ok(new_list())

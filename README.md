@@ -6,7 +6,7 @@ language juicer's themes are written in â€” Go templates and Liquid in spirit â€
 
 ```
 dependencies {
-  squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.1" }
+  squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.2" }
 }
 ```
 

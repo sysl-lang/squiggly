@@ -494,7 +494,7 @@ private index(c: *Ctx, v: Value, i: Value, at: Span) -> Result[Value, TemplateEr
 
             val n = position(c, i, chars.len(), at)?
 
-            Ok(Str(str(chars[n])))
+            Ok(Str(chars[n].to_string()))
         Obj(_) -> i match
             Str(k) -> Ok(v.get(k).unwrap_or(Null))
             _ -> Err(oops(c, at, s"a map is indexed by a string, and this is ${i.kind()}"))

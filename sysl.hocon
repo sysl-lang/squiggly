@@ -9,26 +9,26 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.1" }
+//       squiggly { git = "github.com/sysl-lang/squiggly", version = "0.1.2" }
 //     }
 //
 // The coordinate names the package, `squiggly`; the module a program imports is `sh.sysl.squiggly`.
 
 package {
   name    = "squiggly"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // **The oldest compiler this builds with**, which is the one it was written and tested against.
-  sysl = "0.1.0-alpha.12"
+  sysl = "0.6.0"
 }
 
 // `parsing` is the cursor, the spans and the diagnostic that quotes the line; `toml` and `json` are
 // here for `from_toml` and `from_json`, the two conversions a site generator makes before it renders
 // anything. All three share the one `parsing`, so the closure is three small packages.
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
-  toml    { git = "github.com/sysl-lang/toml",    version = "0.1.3" }
-  json    { git = "github.com/sysl-lang/json",    version = "0.2.1" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.2" }
+  toml    { git = "github.com/sysl-lang/toml",    version = "0.1.4" }
+  json    { git = "github.com/sysl-lang/json",    version = "0.2.2" }
 }
 
 // **`heap = true`, because a value is a tree.** Lists and maps are `Buf`s, the output is gathered in

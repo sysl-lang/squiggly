@@ -268,7 +268,7 @@ private two(n: int) -> string = padded(n, 2)
 
 // `n` written in at least `width` digits, with leading zeros.
 private padded(n: int, width: usize) -> string
-    val digits = str(if n < 0 then -n else n)
+    val digits = (if n < 0 then -n else n).to_string()
     val zeros = if digits.len < width then sysl.text.repeat("0", width - digits.len) else ""
 
     (if n < 0 then "-" else "") + zeros + digits
@@ -314,7 +314,7 @@ slugify(s: string) -> string
 private fold(ch: char) -> string
     val c = u32(ch)
 
-    if c < 0xc0 then return str(ch)
+    if c < 0xc0 then return ch.to_string()
 
     val pairs: []const string = [
         "àa", "áa", "âa", "ãa", "äa", "åa", "āa", "ăa", "ąa", "çc", "ćc", "čc", "ďd", "èe", "ée", "êe",
@@ -326,9 +326,9 @@ private fold(ch: char) -> string
     for p in pairs
         val first = p.chars.peek().unwrap()
 
-        if first == ch then return p[str(first).len..<p.len]
+        if first == ch then return p[first.to_string().len..<p.len]
 
-    str(ch)
+    ch.to_string()
 
 /** Text made into a URL segment the way Hugo's `urlize` does: trimmed, each space a `-` (but never
  * two in a row), and anything that is neither a letter nor a digit dropped. Case is kept. Empty

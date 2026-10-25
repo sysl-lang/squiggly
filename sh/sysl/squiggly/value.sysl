@@ -223,8 +223,8 @@ write_value(b: *StrBuilder, v: Value)
     v match
         Null -> ()
         Bool(x) -> b.push(if x then "true" else "false")
-        Int(n) -> b.push(str(n))
-        Real(x) -> b.push(str(x))
+        Int(n) -> b.push(n.to_string())
+        Real(x) -> b.push(x.to_string())
         Str(s) -> b.push(s)
         List(xs) ->
             b.push("[")
