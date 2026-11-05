@@ -83,8 +83,8 @@ enum Value
             var found: Option[Value] = None
 
             for i in 0..<es.len()
-                if es.at(i).key == key then
-                    found = Some(es.at(i).value)
+                if es[i].key == key then
+                    found = Some(es[i].value)
                     break
 
             found
@@ -92,7 +92,7 @@ enum Value
 
     /** The element at `i`, or `None` where this is not a list or is not that long. */
     at(self, i: usize) -> Option[Value] = self match
-        List(xs) -> if i < xs.len() then Some(xs.at(i)) else None
+        List(xs) -> if i < xs.len() then Some(xs[i]) else None
         _ -> None
 
     /** How many elements a list has, entries a map has, or characters a string has; `0` for the
@@ -114,8 +114,8 @@ enum Value
             var done = false
 
             for i in 0..<es.len()
-                if es.at(i).key == key then
-                    es.set(i, Entry(key, v))
+                if es[i].key == key then
+                    es[i] = Entry(key, v)
                     done = true
                     break
 
@@ -187,7 +187,7 @@ private lists_equal(xs: Buf[Value], ys: Buf[Value]) -> bool
     if xs.len() != ys.len() then return false
 
     for i in 0..<xs.len()
-        if xs.at(i) != ys.at(i) then return false
+        if xs[i] != ys[i] then return false
 
     true
 
@@ -197,8 +197,8 @@ private maps_equal(es: Buf[Entry], fs: Buf[Entry]) -> bool
     val other = Obj(fs)
 
     for i in 0..<es.len()
-        other.get(es.at(i).key) match
-            Some(v) -> if v != es.at(i).value then return false
+        other.get(es[i].key) match
+            Some(v) -> if v != es[i].value then return false
             None -> return false
 
     true
@@ -232,7 +232,7 @@ write_value(b: *StrBuilder, v: Value)
             for i in 0..<xs.len()
                 if i > 0 then b.push(", ")
 
-                write_value(b, xs.at(i))
+                write_value(b, xs[i])
 
             b.push("]")
         Obj(es) ->
@@ -241,9 +241,9 @@ write_value(b: *StrBuilder, v: Value)
             for i in 0..<es.len()
                 if i > 0 then b.push(", ")
 
-                b.push(es.at(i).key)
+                b.push(es[i].key)
                 b.push(": ")
-                write_value(b, es.at(i).value)
+                write_value(b, es[i].value)
 
             b.push("}")
         Lambda(_) -> b.push("<lambda>")

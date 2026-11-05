@@ -523,7 +523,7 @@ private b_find_re(c: *Ctx, a: Buf[Value]) -> Result[Value, Fail]
     for i in 0..<all.len()
         if long(i) >= limit then break
 
-        val m = all.at(i)
+        val m = all[i]
         val groups: Buf[Value] = buf()
 
         groups.push(Str(m.text()))
