@@ -1,3 +1,6 @@
 github.com/sysl-lang/json v0.2.4 sha256:9dbc05db3559ebac3286fda5f4ab0c3991ba748c3b82f982b930168f049bc40d
+github.com/sysl-lang/json v0.2.5 sha256:85fc04b6986477b6de0623754ecec91123aea24144dfdfb258153f2c12315651
 github.com/sysl-lang/parsing v0.14.1 sha256:a8da830d00560772bc997c0f58d61d22a65fdcabd66c95c685528eb241c08038
+github.com/sysl-lang/parsing v0.14.2 sha256:6a71afa1772c34482ca86d0d1af334e49f2fc19cf88356028b86b17335a42bcb
 github.com/sysl-lang/toml v0.1.5 sha256:5d618ec1c07ca104a8e5b4b7f90b25a1c413c3be836767c46a3065ebc9f527c1
+github.com/sysl-lang/toml v0.1.6 sha256:595e3811bb96904c8f3496a14c4afc175cea6e28810dfb983bb6df6f49ba0728
