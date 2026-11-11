@@ -4,7 +4,7 @@ import sh.sysl.json.Json
 import sh.sysl.toml
 import sysl.buf.{Buf, buf}
 import sysl.text.parse_real
-import sysl.time.{LocalDate, LocalTime, date_text, hour_of, minute_of, offset_text, second_of, us_of}
+import sysl.time.{Date, Time, date_text, hour_of, minute_of, offset_text, second_of, us_of}
 
 // The two conversions a site generator makes before it renders anything: front matter and
 // configuration from TOML, data files from JSON.
@@ -67,7 +67,7 @@ from_json(v: Json) -> Value
 end from_json
 
 // `09:30:00`, with the fraction only where there is one.
-private iso_time(t: LocalTime) -> string
+private iso_time(t: Time) -> string
     val base = f"${hour_of(t)}%02d:${minute_of(t)}%02d:${second_of(t)}%02d"
 
     if us_of(t) == 0 then base else f"${base}.${us_of(t)}%06d"

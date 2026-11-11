@@ -3,9 +3,9 @@ module sh.sysl.squiggly
 import sysl.buf.{Buf, buf}
 import sysl.fmt.{format_int, format_real}
 import sysl.text.{Ascii, Search, str_builder, to_lower}
-import sysl.time.{LocalDateTime, Offset, Weekday, at_offset, day_of, day_of_year, hour_of, minute_of,
+import sysl.time.{DateTime, Offset, Weekday, at_offset, day_of, day_of_year, hour_of, minute_of,
                   month_name, month_of, offset_text, parse_date, parse_datetime, parse_offset,
-                  parse_timestamp, second_of, us_of, weekday, weekday_name, year_of, LocalTime}
+                  parse_timestamp, second_of, us_of, weekday, weekday_name, year_of, Time}
 
 // The three formatters that are more than a line: `printf`, dates, and slugs.
 
@@ -143,7 +143,7 @@ private group_thousands(text: string) -> string
 
 // A date read from text: the wall-clock reading, and the offset it was written with if it had one.
 private struct When
-    local: LocalDateTime
+    local: DateTime
     offset: Option[Offset]
 
 // `2024-03-12`, `2024-03-12T09:30:00`, `2024-03-12 09:30`, or any of those with `Z` or `+05:30`.
@@ -162,7 +162,7 @@ private read_when(s: string) -> Result[When, string]
         Err(_) -> ()
 
     parse_date(s) match
-        Ok(d) -> Ok(When(LocalDateTime(d, LocalTime(0)), None))
+        Ok(d) -> Ok(When(DateTime(d, Time(0)), None))
         Err(_) -> Err(s"`$s` is not a date: a date is written `2024-03-12`, and a time after it `T09:30:00Z`")
 
 /** Milliseconds from 1970-01-01T00:00:00Z to the date written; a date with no offset is read as UTC. */
